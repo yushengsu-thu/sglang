@@ -71,6 +71,9 @@ class LoRAAdapter(nn.Module):
             ]
         )
 
+        # Storage for embedding weights (not linear layer)
+        self.embedding_weights: Dict[str, torch.Tensor] = {}
+
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
@@ -81,6 +84,12 @@ class LoRAAdapter(nn.Module):
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
+            # Check if this is an embedding weight
+            if "embed_tokens" in name or "lm_head" in name:
+                self.embedding_weights[name] = loaded_weight.cpu()
+                continue
+                
+            # Linear layers
             layer_id = get_layer_id(name)
             if layer_id is not None:
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()

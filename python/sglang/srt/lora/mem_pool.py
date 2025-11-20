@@ -74,8 +74,13 @@ class LoRAMemoryPool:
         #   (max_loras_per_batch, stacked_num * max_lora_dim, input_dim)
         # B_buffer contains num_layer number of column-major tensors with shape
         #   (stacked_num, max_loras_per_batch, output_dim, max_lora_dim)
+        # Separate buffers for per-layer modules and standalone modules
         self.A_buffer: Dict[str, List[torch.Tensor]] = {}
         self.B_buffer: Dict[str, List[torch.Tensor]] = {}
+
+        # Separate buffers for embedding and lm_head (not per-layer)
+        self.embedding_A_buffer: Dict[str, torch.Tensor] = {}
+        self.embedding_B_buffer: Dict[str, torch.Tensor] = {}
 
         # Lora uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
@@ -160,6 +165,10 @@ class LoRAMemoryPool:
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
         ):
             for module_name in target_modules:
+                # Skip embedding modules here - they're handled separately
+                if module_name in ["embed_tokens", "lm_head"]:
+                    continue
+                    
                 buffer[module_name] = [
                     torch.empty(
                         get_lora_shape_fn(
@@ -185,6 +194,54 @@ class LoRAMemoryPool:
             self.target_modules,
             self.get_lora_B_shape,
         )
+    
+        # Initialize embedding buffers (single, not per-layer)
+        for module_name in ["embed_tokens", "lm_head"]:
+            if module_name in self.target_modules:
+                shape_a = self.get_embedding_lora_A_shape(module_name, base_model)
+                shape_b = self.get_embedding_lora_B_shape(module_name, base_model)
+                
+                self.embedding_A_buffer[module_name] = torch.empty(
+                    shape_a, dtype=self.dtype, device=device
+                )
+                self.embedding_B_buffer[module_name] = torch.empty(
+                    shape_b, dtype=self.dtype, device=device
+                )
+
+
+    def get_embedding_lora_A_shape(
+        self, module_name: str, 
+        base_model: torch.nn.Module) -> Tuple[int]:
+        
+        """Get shape for embedding LoRA A matrix."""
+        # A maps vocab_size -> rank
+        if module_name == "embed_tokens":
+            module = base_model.model.embed_tokens  # Adjust path based on your model
+        elif module_name == "lm_head":
+            module = base_model.lm_head
+        
+        vocab_size = module.num_embeddings_per_partition if hasattr(module, 'num_embeddings_per_partition') else module.num_embeddings
+        if self.tp_size > 1:
+            vocab_size = divide(vocab_size, self.tp_size)
+        
+        return (self.max_loras_per_batch, vocab_size, self.max_lora_rank)
+
+
+    def get_embedding_lora_B_shape(
+        self, module_name: str, 
+        base_model: torch.nn.Module) -> Tuple[int]:
+        
+        """Get shape for embedding LoRA B matrix."""
+        # B maps rank -> embedding_dim
+        if module_name == "embed_tokens":
+            module = base_model.model.embed_tokens
+        elif module_name == "lm_head":
+            module = base_model.lm_head
+        
+        embedding_dim = module.embedding_dim
+        
+        return (self.max_loras_per_batch, embedding_dim, self.max_lora_rank)
+
 
     def prepare_lora_batch(
         self,
@@ -273,10 +330,17 @@ class LoRAMemoryPool:
             for i in range(self.num_layer):
                 for k in self.A_buffer.keys():
                     self.A_buffer[k][i][buffer_id] = 0
+            # Also zero out embedding buffers for base model
+            for k in self.embedding_A_buffer.keys():
+                self.embedding_A_buffer[k][buffer_id] = 0
+            for k in self.embedding_B_buffer.keys():
+                self.embedding_B_buffer[k][buffer_id] = 0
             return
 
         assert lora_adapter is not None
         lora_rank = lora_adapter.config.r
+        
+        # Handle linear layer modules
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
             temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
@@ -320,6 +384,32 @@ class LoRAMemoryPool:
                 target_buffer = self.B_buffer[name][layer_id]
                 buffer_view = target_buffer[buffer_id, :, :lora_rank]
                 load_lora_weight_tensor(buffer_view, weights)
+            
+        # Handle embedding modules separately
+        if hasattr(lora_adapter, 'embedding_weights'):
+            for module_name in ["embed_tokens", "lm_head"]:
+                if module_name in self.target_modules:
+                    # Load embedding LoRA weights
+                    a_key = f"{module_name}.lora_A"
+                    b_key = f"{module_name}.lora_B"
+                    
+                    if a_key in lora_adapter.embedding_weights:
+                        A_weight = lora_adapter.embedding_weights[a_key]
+                        B_weight = lora_adapter.embedding_weights[b_key]
+
+                        # Slice for tensor parallelism if needed
+                        if self.tp_size > 1 and module_name in lora_modules:
+                            module = lora_modules[module_name]
+                            A_weight = module.slice_lora_a_weights(A_weight, self.tp_rank)
+                            B_weight = module.slice_lora_b_weights(B_weight, self.tp_rank)
+                        
+                        # Copy to buffer
+                        buffer_a = self.embedding_A_buffer[module_name]
+                        buffer_b = self.embedding_B_buffer[module_name]
+                        
+                        buffer_a[buffer_id, :, :lora_rank].copy_(A_weight)
+                        buffer_b[buffer_id, :, :lora_rank].copy_(B_weight)
+
 
     def get_tensor(
         self, target_module: str, layer_id: int, lora_type: LoRAType

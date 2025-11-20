@@ -442,6 +442,9 @@ class LoRAManager:
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
 
+        # Separate dict for non-linear-layer modules (embeddings)
+        self.embedding_lora_modules: Dict[str, BaseLayerWithLoRA] = {}
+        
         for module_name, module in self.base_model.named_modules():
             # TODO (lifuhuang): in the future, we should consider generalizing the
             # should_apply_lora function to support mapping by full module name instead
@@ -453,9 +456,19 @@ class LoRAManager:
             ) and not self.base_model.should_apply_lora(module_name):
                 continue
 
-            # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
-                layer_id = get_layer_id(module_name)
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
+            module_short_name = module_name.split(".")[-1]
+
+            # Handle embedding modules separately
+            if module_short_name in ["embed_tokens", "lm_head"] and module_short_name in self.target_modules:
+                self.embedding_lora_modules[module_name] = self.set_lora_module(
                     module_name, module
                 )
+                continue
+
+            # Existing linear layer module handling
+            if module_short_name in self.target_modules:
+                layer_id = get_layer_id(module_name)
+                if layer_id is not None:
+                    self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                        module_name, module
+                    )

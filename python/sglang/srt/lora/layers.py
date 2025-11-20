@@ -46,10 +46,9 @@ class BaseLayerWithLoRA(nn.Module):
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """
     Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
-
-    Note: The current version does not yet implement the LoRA functionality.
-    This class behaves exactly the same as the base VocabParallelEmbedding.
-    Future versions will integrate LoRA functionality to support efficient parameter fine-tuning.
+    
+    This implements LoRA for embedding layers by adding low-rank adaptations
+    to the embedding weight matrix.
     """
 
     def __init__(
@@ -59,6 +58,82 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_backend)
         self.weight = base_layer.weight
+        
+        # For tensor parallelism - embedding is sharded along vocab dimension
+        # Get the shard size for this rank
+        if hasattr(base_layer, 'num_embeddings_per_partition'):
+            shard_size = base_layer.num_embeddings_per_partition
+        else:
+            # Calculate based on TP size
+            tp_size = get_tensor_model_parallel_world_size()
+            shard_size = divide(base_layer.num_embeddings, tp_size)
+        
+        self.output_offset = torch.tensor(
+            [0, base_layer.embedding_dim],
+            dtype=torch.int32,
+            device=next(self.base_layer.parameters()).device,
+        )
+
+    def set_lora_info(
+        self,
+        A_buffer: torch.Tensor,
+        B_buffer: torch.Tensor,
+    ):
+        self.set_lora = True
+        self.A_buffer = A_buffer
+        self.B_buffer = B_buffer
+
+    def apply_lora(
+        self, 
+        base_output: torch.Tensor, 
+        input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply LoRA to embedding output.
+        
+        For embeddings, we need to:
+        1. Look up the LoRA A weights for the input tokens
+        2. Multiply by LoRA B weights
+        3. Add to base embedding output
+        """
+        # This requires special handling in the backend
+        # because embedding is a lookup, not a matmul
+        lora_output = self.lora_backend.run_embedding_lora(
+            input_ids=input_ids,
+            embedding_lora_a=self.A_buffer,
+            embedding_lora_b=self.B_buffer,
+            base_output=base_output,
+            output_offset=self.output_offset,
+        )
+        return lora_output
+
+    def forward(self, input_ids: torch.Tensor):
+        # Call base embedding layer
+        base_output = self.base_layer.forward(input_ids)
+        
+        if self.set_lora:
+            base_output = self.apply_lora(base_output, input_ids)
+        
+        return base_output
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        """
+        Slice LoRA A weights for tensor parallelism.
+        For embeddings, A is indexed by vocab, so we shard along vocab dimension.
+        """
+        tp_size = get_tensor_model_parallel_world_size()
+        vocab_size = A.shape[0]
+        shard_size = vocab_size // tp_size
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
+        return A[start_idx:end_idx, :].contiguous()
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        """
+        Slice LoRA B weights for tensor parallelism.
+        For embeddings, B is not sharded as it maps rank to embedding_dim.
+        """
+        return B
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
