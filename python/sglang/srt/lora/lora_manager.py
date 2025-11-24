@@ -257,6 +257,7 @@ class LoRAManager:
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
             lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
+            embedding_lora_modules=self.embedding_lora_modules, 
         )
 
         # set up batch info shared by all lora modules
@@ -305,6 +306,21 @@ class LoRAManager:
                     self.memory_pool.get_tensor(
                         target_module=target_module,
                         layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
+                    ),
+                )
+            
+        for module_name, module in self.embedding_lora_modules.items():
+            # Extract short name (e.g., "model.embed_tokens" -> "embed_tokens")
+            module_short_name = module_name.split(".")[-1]
+            if module_short_name in self.memory_pool.target_modules:
+                module.set_lora_info(
+                    self.memory_pool.get_embedding_tensor(
+                        module_name=module_short_name,
+                        lora_type=LoRAType.LORA_A,
+                    ),
+                    self.memory_pool.get_embedding_tensor(
+                        module_name=module_short_name,
                         lora_type=LoRAType.LORA_B,
                     ),
                 )
@@ -463,10 +479,8 @@ class LoRAManager:
                 self.embedding_lora_modules[module_name] = self.set_lora_module(
                     module_name, module
                 )
-                continue
-
             # Existing linear layer module handling
-            if module_short_name in self.target_modules:
+            elif module_short_name in self.target_modules:
                 layer_id = get_layer_id(module_name)
                 if layer_id is not None:
                     self.lora_modules[layer_id][module_name] = self.set_lora_module(

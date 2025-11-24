@@ -59,14 +59,25 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_backend)
         self.weight = base_layer.weight
         
-        # For tensor parallelism - embedding is sharded along vocab dimension
-        # Get the shard size for this rank
+        # Expose base_layer attributes for compatibility
+        self.num_embeddings = base_layer.num_embeddings
+        self.embedding_dim = base_layer.embedding_dim
+        
+        # Get partition info from base_layer (it should already have these)
         if hasattr(base_layer, 'num_embeddings_per_partition'):
-            shard_size = base_layer.num_embeddings_per_partition
+            self.num_embeddings_per_partition = base_layer.num_embeddings_per_partition
+        elif hasattr(base_layer, 'tp_size'):
+            # Calculate based on tp_size from base_layer
+            # Ensure divisibility
+            assert base_layer.num_embeddings % base_layer.tp_size == 0, \
+                f"num_embeddings ({base_layer.num_embeddings}) must be divisible by tp_size ({base_layer.tp_size})"
+            self.num_embeddings_per_partition = base_layer.num_embeddings // base_layer.tp_size
         else:
-            # Calculate based on TP size
-            tp_size = get_tensor_model_parallel_world_size()
-            shard_size = divide(base_layer.num_embeddings, tp_size)
+            # Single GPU case - no partitioning
+            self.num_embeddings_per_partition = base_layer.num_embeddings
+        
+        # Store tp_size for use in slice methods
+        self.tp_size = getattr(base_layer, 'tp_size', 1)
         
         self.output_offset = torch.tensor(
             [0, base_layer.embedding_dim],
@@ -89,23 +100,66 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         input_ids: torch.Tensor
     ) -> torch.Tensor:
         """
-        Apply LoRA to embedding output.
-        
-        For embeddings, we need to:
-        1. Look up the LoRA A weights for the input tokens
-        2. Multiply by LoRA B weights
-        3. Add to base embedding output
+        Apply LoRA to embedding output with proper batching and scaling.
         """
-        # This requires special handling in the backend
-        # because embedding is a lookup, not a matmul
-        lora_output = self.lora_backend.run_embedding_lora(
-            input_ids=input_ids,
-            embedding_lora_a=self.A_buffer,
-            embedding_lora_b=self.B_buffer,
-            base_output=base_output,
-            output_offset=self.output_offset,
-        )
-        return lora_output
+        # Get batch info from backend
+        if not hasattr(self.lora_backend, 'batch_info') or self.lora_backend.batch_info is None:
+            return base_output
+        
+        batch_info = self.lora_backend.batch_info
+        
+        # Flatten input for processing
+        original_shape = base_output.shape
+        input_ids_flat = input_ids.flatten()
+        base_output_flat = base_output.view(-1, base_output.shape[-1])
+        
+        # Initialize output
+        lora_output = torch.zeros_like(base_output_flat)
+        
+        # Get segment information
+        seg_indptr = batch_info.seg_indptr  # (num_segments + 1,)
+        weight_indices = batch_info.weight_indices  # (num_segments,)
+        scalings = batch_info.scalings  # (max_loras_per_batch,)
+        
+        # Process each segment
+        for seg_idx in range(batch_info.num_segments):
+            # Get segment boundaries
+            start_idx = seg_indptr[seg_idx].item()
+            end_idx = seg_indptr[seg_idx + 1].item()
+            
+            # Get LoRA buffer ID for this segment
+            lora_buffer_idx = weight_indices[seg_idx].item()
+            
+            # Skip if this segment uses base model (lora_buffer_idx == 0)
+            if lora_buffer_idx == 0:
+                continue
+            
+            # Get scaling factor for this LoRA
+            scaling = scalings[lora_buffer_idx].item()
+            
+            # Process all tokens in this segment
+            for token_idx in range(start_idx, end_idx):
+                # Get the actual token ID
+                token_id = input_ids_flat[token_idx].item()
+                
+                # Lookup LoRA A weight for this token
+                # A_buffer: (max_loras_per_batch, vocab_size, rank)
+                lora_a_vec = self.A_buffer[lora_buffer_idx, token_id, :]  # (rank,)
+                
+                # Apply LoRA B
+                # B_buffer: (max_loras_per_batch, emb_dim, rank)
+                lora_contribution = torch.matmul(
+                    lora_a_vec, 
+                    self.B_buffer[lora_buffer_idx, :, :].T
+                )  # (emb_dim,)
+                
+                # Add scaled LoRA contribution
+                lora_output[token_idx] = lora_contribution * scaling
+        
+        # Add to base output
+        output = base_output_flat + lora_output
+        
+        return output.view(original_shape)
 
     def forward(self, input_ids: torch.Tensor):
         # Call base embedding layer
@@ -121,9 +175,14 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Slice LoRA A weights for tensor parallelism.
         For embeddings, A is indexed by vocab, so we shard along vocab dimension.
         """
-        tp_size = get_tensor_model_parallel_world_size()
+        if self.tp_size == 1:
+            return A
+        
         vocab_size = A.shape[0]
-        shard_size = vocab_size // tp_size
+        assert vocab_size % self.tp_size == 0, \
+            f"vocab_size ({vocab_size}) must be divisible by tp_size ({self.tp_size})"
+        
+        shard_size = vocab_size // self.tp_size
         start_idx = tp_rank * shard_size
         end_idx = (tp_rank + 1) * shard_size
         return A[start_idx:end_idx, :].contiguous()

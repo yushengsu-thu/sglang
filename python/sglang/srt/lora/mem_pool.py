@@ -220,7 +220,17 @@ class LoRAMemoryPool:
         elif module_name == "lm_head":
             module = base_model.lm_head
         
-        vocab_size = module.num_embeddings_per_partition if hasattr(module, 'num_embeddings_per_partition') else module.num_embeddings
+        # Handle wrapped LoRA layer - access base_layer if needed
+        if hasattr(module, 'base_layer'):
+            base_module = module.base_layer
+        else:
+            base_module = module
+        
+        vocab_size = (
+            base_module.num_embeddings_per_partition 
+            if hasattr(base_module, 'num_embeddings_per_partition') 
+            else base_module.num_embeddings
+        )
         if self.tp_size > 1:
             vocab_size = divide(vocab_size, self.tp_size)
         
@@ -238,7 +248,13 @@ class LoRAMemoryPool:
         elif module_name == "lm_head":
             module = base_model.lm_head
         
-        embedding_dim = module.embedding_dim
+        # Handle wrapped LoRA layer - access base_layer if needed
+        if hasattr(module, 'base_layer'):
+            base_module = module.base_layer
+        else:
+            base_module = module
+        
+        embedding_dim = base_module.embedding_dim
         
         return (self.max_loras_per_batch, embedding_dim, self.max_lora_rank)
 
@@ -249,6 +265,7 @@ class LoRAMemoryPool:
         lora_adapters: Dict[str, LoRAAdapter],
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         lora_refs: Dict[str, LoRARef],
+        embedding_lora_modules: Dict[str, BaseLayerWithLoRA],
     ):
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
@@ -301,7 +318,7 @@ class LoRAMemoryPool:
                 buffer_id = get_available_buffer_slot()
                 lora_adapter = lora_adapters.get(uid, None)
                 self.load_lora_weight_to_buffer(
-                    uid, buffer_id, lora_adapter, lora_modules
+                    uid, buffer_id, lora_adapter, lora_modules, embedding_lora_modules
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
@@ -312,6 +329,7 @@ class LoRAMemoryPool:
         buffer_id: int,
         lora_adapter: LoRAAdapter,
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+        embedding_lora_modules: Dict[str, BaseLayerWithLoRA] = None,
     ):
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
@@ -326,6 +344,13 @@ class LoRAMemoryPool:
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                 buffer_view.copy_(weight)
 
+        # Create short name to module mapping for embedding modules
+        embedding_modules_by_short_name = {}
+        if embedding_lora_modules:
+            for full_name, module in embedding_lora_modules.items():
+                short_name = full_name.split(".")[-1]
+                embedding_modules_by_short_name[short_name] = module
+        
         if uid is None:
             for i in range(self.num_layer):
                 for k in self.A_buffer.keys():
@@ -389,24 +414,54 @@ class LoRAMemoryPool:
         if hasattr(lora_adapter, 'embedding_weights'):
             for module_name in ["embed_tokens", "lm_head"]:
                 if module_name in self.target_modules:
-                    # Load embedding LoRA weights
-                    a_key = f"{module_name}.lora_A"
-                    b_key = f"{module_name}.lora_B"
+                    # Find matching keys by checking if module_name is in the key
+                    A_weight = None
+                    B_weight = None
                     
-                    if a_key in lora_adapter.embedding_weights:
-                        A_weight = lora_adapter.embedding_weights[a_key]
-                        B_weight = lora_adapter.embedding_weights[b_key]
-
+                    for weight_name, weight in lora_adapter.embedding_weights.items():
+                        if module_name in weight_name:
+                            if "lora_A" in weight_name:
+                                A_weight = weight
+                            elif "lora_B" in weight_name:
+                                B_weight = weight
+                    
+                    if A_weight is not None and B_weight is not None:
                         # Slice for tensor parallelism if needed
-                        if self.tp_size > 1 and module_name in lora_modules:
-                            module = lora_modules[module_name]
+                        if self.tp_size > 1 and module_name in embedding_modules_by_short_name:
+                            module = embedding_modules_by_short_name[module_name]
                             A_weight = module.slice_lora_a_weights(A_weight, self.tp_rank)
                             B_weight = module.slice_lora_b_weights(B_weight, self.tp_rank)
                         
-                        # Copy to buffer
+                        # Get buffer references
                         buffer_a = self.embedding_A_buffer[module_name]
                         buffer_b = self.embedding_B_buffer[module_name]
                         
+                        # Get expected shapes
+                        expected_a_shape = buffer_a[buffer_id, :, :lora_rank].shape  # (vocab_size, rank)
+                        expected_b_shape = buffer_b[buffer_id, :, :lora_rank].shape  # (emb_dim, rank)
+                        
+                        # Auto-transpose if needed (PEFT format is transposed)
+                        if A_weight.shape != expected_a_shape:
+                            if A_weight.shape == (expected_a_shape[1], expected_a_shape[0]):
+                                # Transpose from (rank, vocab_size) to (vocab_size, rank)
+                                A_weight = A_weight.T
+                            else:
+                                raise ValueError(
+                                    f"LoRA A weight shape mismatch for {module_name}: "
+                                    f"got {A_weight.shape}, expected {expected_a_shape} or transposed"
+                                )
+                        
+                        if B_weight.shape != expected_b_shape:
+                            if B_weight.shape == (expected_b_shape[1], expected_b_shape[0]):
+                                # Transpose if needed
+                                B_weight = B_weight.T
+                            else:
+                                raise ValueError(
+                                    f"LoRA B weight shape mismatch for {module_name}: "
+                                    f"got {B_weight.shape}, expected {expected_b_shape} or transposed"
+                                )
+                        
+                        # Copy to buffer
                         buffer_a[buffer_id, :, :lora_rank].copy_(A_weight)
                         buffer_b[buffer_id, :, :lora_rank].copy_(B_weight)
 
@@ -418,6 +473,18 @@ class LoRAMemoryPool:
             return self.A_buffer[target_module][layer_id]
 
         return self.B_buffer[target_module][layer_id]
+
+    def get_embedding_tensor(
+        self, module_name: str, lora_type: LoRAType
+    ) -> torch.Tensor:
+        """
+        Get embedding LoRA tensor (for embed_tokens or lm_head).
+        Unlike get_tensor(), this doesn't require layer_id since embeddings are not per-layer.
+        """
+        if lora_type == LoRAType.LORA_A:
+            return self.embedding_A_buffer[module_name]
+
+        return self.embedding_B_buffer[module_name]
 
     def get_buffer_id(self, lora_uid: str):
         return self.uid_to_buffer_id[lora_uid]

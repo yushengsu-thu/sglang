@@ -87,12 +87,11 @@ class LoRAAdapter(nn.Module):
             # Check if this is an embedding weight
             if "embed_tokens" in name or "lm_head" in name:
                 self.embedding_weights[name] = loaded_weight.cpu()
-                continue
-                
-            # Linear layers
-            layer_id = get_layer_id(name)
-            if layer_id is not None:
-                self.layers[layer_id].weights[name] = loaded_weight.cpu()
+            else:    
+                # Linear layers
+                layer_id = get_layer_id(name)
+                if layer_id is not None:
+                    self.layers[layer_id].weights[name] = loaded_weight.cpu()
 
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:
