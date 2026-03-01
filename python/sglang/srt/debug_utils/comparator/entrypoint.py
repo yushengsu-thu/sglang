@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterator, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 import polars as pl
 
@@ -10,7 +10,8 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.aux_loader import (
     AUX_NAMES,
 )
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.entrypoint import (
-    compute_maybe_token_aligner_plan,
+    TokenAlignerResult,
+    compute_maybe_token_aligner_result,
 )
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerPlan,
@@ -20,16 +21,18 @@ from sglang.srt.debug_utils.comparator.bundle_matcher import (
     TensorBundleInfo,
     match_bundles,
 )
+from sglang.srt.debug_utils.comparator.display import emit_display_records
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
+    NonTensorRecord,
     SkipRecord,
     SummaryRecord,
     print_record,
 )
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
-from sglang.srt.debug_utils.dump_loader import read_meta
+from sglang.srt.debug_utils.dump_loader import read_meta, read_tokenizer_path
 
 
 def main() -> None:
@@ -46,27 +49,67 @@ def run(args: argparse.Namespace) -> None:
     warning_sink.set_output_format(args.output_format)
 
     dfs: Pair[pl.DataFrame] = _read_df(args)
-    token_aligner_plan = compute_maybe_token_aligner_plan(args, dfs)
+
+    tokenizer: Any = _maybe_load_tokenizer(args)
+    for label, df, dump_dir in [
+        ("baseline", dfs.x, Path(args.baseline_path)),
+        ("target", dfs.y, Path(args.target_path)),
+    ]:
+        emit_display_records(
+            df=df,
+            dump_dir=dump_dir,
+            label=label,
+            tokenizer=tokenizer,
+            output_format=args.output_format,
+        )
+
+    ta_result: TokenAlignerResult = compute_maybe_token_aligner_result(args, dfs)
 
     dfs = dfs.map(lambda df: df.filter(~pl.col("name").is_in(AUX_NAMES)))
 
     bundle_info_pairs: list[Pair[TensorBundleInfo]] = match_bundles(
         dfs=dfs,
         skip_keys=_compute_skip_keys(
-            args, has_token_aligner_plan=token_aligner_plan is not None
+            args, has_token_aligner_plan=ta_result.plan is not None
         ),
+    )
+
+    viz_output_dir: Optional[Path] = (
+        Path(args.viz_output_dir) if args.viz_bundle_details else None
     )
 
     comparison_records = _compare_bundle_pairs(
         bundle_info_pairs=bundle_info_pairs,
         baseline_path=Path(args.baseline_path),
         target_path=Path(args.target_path),
-        token_aligner_plan=token_aligner_plan,
+        token_aligner_plan=ta_result.plan,
         diff_threshold=args.diff_threshold,
+        thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
+        viz_output_dir=viz_output_dir,
     )
     _consume_comparison_records(
         comparison_records=comparison_records, output_format=args.output_format
     )
+
+
+def _maybe_load_tokenizer(args: argparse.Namespace) -> Any:
+    tokenizer_path: Optional[str] = getattr(args, "tokenizer", None)
+
+    if tokenizer_path is None:
+        for directory in [Path(args.baseline_path), Path(args.target_path)]:
+            tokenizer_path = read_tokenizer_path(directory)
+            if tokenizer_path is not None:
+                break
+
+    if tokenizer_path is None:
+        return None
+
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception:
+        return None
 
 
 def _read_df(args: argparse.Namespace) -> Pair[pl.DataFrame]:
@@ -86,7 +129,7 @@ def _read_df(args: argparse.Namespace) -> Pair[pl.DataFrame]:
 def _compute_skip_keys(args, *, has_token_aligner_plan: bool):
     skip_keys: set[str] = {"dump_index", "filename"}
     if args.grouping == "logical":
-        skip_keys |= {"rank"}
+        skip_keys |= {"rank", "recompute_status"}
         if has_token_aligner_plan:
             skip_keys |= {"step"}
     return skip_keys
@@ -99,7 +142,9 @@ def _compare_bundle_pairs(
     target_path: Path,
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
-) -> Iterator[Union[ComparisonRecord, SkipRecord]]:
+    thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]],
+    viz_output_dir: Optional[Path] = None,
+) -> Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]]:
     for bundle_info_pair in bundle_info_pairs:
         if not bundle_info_pair.y:
             continue
@@ -115,12 +160,14 @@ def _compare_bundle_pairs(
             target_path=target_path,
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
+            thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
+            viz_output_dir=viz_output_dir,
         )
 
 
 def _consume_comparison_records(
     *,
-    comparison_records: Iterator[Union[ComparisonRecord, SkipRecord]],
+    comparison_records: Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]],
     output_format: str,
 ) -> None:
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
@@ -158,5 +205,23 @@ def _parse_args() -> argparse.Namespace:
         choices=["logical", "raw"],
         default="logical",
         help="Grouping mode: logical (cross-rank unshard) or raw (rank-by-rank)",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Tokenizer path for decoding input_ids (auto-discovered from dump metadata if not set)",
+    )
+    parser.add_argument(
+        "--viz-bundle-details",
+        action="store_true",
+        default=False,
+        help="Generate comparison heatmap/histogram PNG for each compared tensor",
+    )
+    parser.add_argument(
+        "--viz-output-dir",
+        type=str,
+        default="/tmp/comparator_viz/",
+        help="Output directory for visualization PNGs (default: /tmp/comparator_viz/)",
     )
     return parser.parse_args()
