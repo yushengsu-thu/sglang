@@ -136,6 +136,7 @@ def use_fused_moe_lora_kernel(
     max_loras,
     num_experts,
     block_size,
+    mul_routed_weight,
     fully_sharded=False,
     offset=0,
 ):
@@ -185,7 +186,6 @@ def use_fused_moe_lora_kernel(
         "SPLIT_K": 1,
     }
 
-    mul_routed_weight = False
     expert_ids = expert_ids.view(max_loras, -1)
     sorted_token_ids = sorted_token_ids.view(max_loras, -1)
 
@@ -226,28 +226,49 @@ def use_torch(
     hidden_states,
     token_lora_mapping,
     topk_ids,
+    topk_weights,
     lora_a_stacked,
     lora_b_stacked,
     top_k_num,
+    mul_routed_weight,
 ):
     outputs = []
+
+    orig_dtype = hidden_states.dtype
     for i in range(hidden_states.shape[0]):
         lora_idx = token_lora_mapping[i]
         expert_ids = topk_ids[i]
+        expert_weights = topk_weights[i]
+
         lora_a = lora_a_stacked[0][lora_idx][expert_ids]
         lora_b = lora_b_stacked[0][lora_idx][expert_ids]
-        tensors = [
-            hidden_states[i] @ lora_a[x].T @ lora_b[x].T for x in range(top_k_num)
-        ]
+
+        h_f32 = hidden_states[i].to(torch.float32)
+        la_f32 = lora_a.to(torch.float32)
+        lb_f32 = lora_b.to(torch.float32)
+
+        if mul_routed_weight:
+            tensors = [
+                ((h_f32 @ la_f32[x].T @ lb_f32[x].T) * expert_weights[x]).to(
+                    orig_dtype
+                )
+                for x in range(top_k_num)
+            ]
+        else:
+            tensors = [
+                (h_f32 @ la_f32[x].T @ lb_f32[x].T).to(orig_dtype)
+                for x in range(top_k_num)
+            ]
         outputs.append(torch.stack(tensors, dim=0))
     return torch.stack(outputs, dim=0)
 
 
-DTYPES = [torch.float16, torch.bfloat16]
+DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 DEVICES = [f"cuda:{0}"]
 SEED = [42]
 
 
+@pytest.mark.parametrize("mul_routed_weight", [False, True])
 @pytest.mark.parametrize("num_tokens", [100])
 @pytest.mark.parametrize("top_k_num", [6, 12])
 @pytest.mark.parametrize("num_experts", [64])
@@ -260,6 +281,7 @@ SEED = [42]
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("seed", SEED)
 def test_fused_moe_lora_kernel(
+    mul_routed_weight,
     num_tokens,
     top_k_num,
     num_experts,
@@ -339,15 +361,18 @@ def test_fused_moe_lora_kernel(
         max_loras,
         num_experts,
         block_size,
+        mul_routed_weight=mul_routed_weight,
     )
     # pytorch output
     output2 = use_torch(
         hidden_states,
         token_lora_mapping,
         topk_ids,
+        topk_weights,
         lora_a_stacked,
         lora_b_stacked,
         top_k_num,
+        mul_routed_weight=mul_routed_weight,
     )
 
     torch.testing.assert_close(output, output2, atol=1e-2, rtol=1e-2)

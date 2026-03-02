@@ -503,7 +503,7 @@ def _fused_moe_lora(
         shrink_num_warps,
         shrink_num_stages,
         shrink_split_k,
-        mul_routed_weight,
+        mul_routed_weight=False,
     )
 
     if fully_sharded:
