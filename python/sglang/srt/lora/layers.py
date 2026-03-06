@@ -595,8 +595,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         base_layer: FusedMoE,
         lora_backend: BaseLoRABackend,
     ):
-        # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
+
+        self.tp_size = base_layer.moe_tp_size
+        self.tp_rank = base_layer.moe_tp_rank
 
         # initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
@@ -715,6 +717,45 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        return B
+
+    # ---- MoE-specific TP slicing (called by mem_pool for gate_up / down separately) ----
+
+    def slice_w13_lora_a(self, A: torch.Tensor, tp_rank: int) -> torch.Tensor:
+        """gate_up (column-parallel): A input is hidden_size (replicated), no slice needed."""
+        return A
+
+    def slice_w13_lora_b(self, B: torch.Tensor, tp_rank: int) -> torch.Tensor:
+        """gate_up (column-parallel): B output is intermediate_size, slice per TP rank.
+
+        B shape per expert: (intermediate_size * 2, rank)  [gate || up stacked along dim-0]
+        """
+        if self.tp_size <= 1:
+            return B
+        shard_size = self.base_layer.intermediate_size_per_partition
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
+        half = B.shape[0] // 2
+        gate_b = B[:half, :]
+        up_b = B[half:, :]
+        return torch.cat(
+            [gate_b[start_idx:end_idx, :], up_b[start_idx:end_idx, :]], dim=0
+        )
+
+    def slice_w2_lora_a(self, A: torch.Tensor, tp_rank: int) -> torch.Tensor:
+        """down (row-parallel): A input is intermediate_size (partitioned), slice per TP rank.
+
+        A shape per expert: (rank, intermediate_size)
+        """
+        if self.tp_size <= 1:
+            return A
+        shard_size = self.base_layer.intermediate_size_per_partition
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
+        return A[:, start_idx:end_idx].contiguous()
+
+    def slice_w2_lora_b(self, B: torch.Tensor, tp_rank: int) -> torch.Tensor:
+        """down (row-parallel): B output is hidden_size (replicated then all-reduced), no slice needed."""
         return B
 
 
