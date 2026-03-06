@@ -518,8 +518,7 @@ struct MoeLoraAlignBlockSizeKernel {
 
     if (small_batch_expert_mode) {
       const int32_t num_thread = std::max((int32_t)num_experts, 128);
-      const int32_t shared_mem =
-          (num_thread + 1) * num_experts * sizeof(int32_t) + (num_experts + 1) * sizeof(int32_t);
+      const int32_t shared_mem = (num_thread + 1) * num_experts * sizeof(int32_t) + (num_experts + 1) * sizeof(int32_t);
       if (shared_mem > device_max_shared_mem) {
         RuntimeCheck(false, "Shared memory usage exceeds device limit.");
       }
