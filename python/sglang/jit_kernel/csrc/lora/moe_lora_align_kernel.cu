@@ -11,33 +11,16 @@
 
 #include <algorithm>
 
-// ================================================================
-// STANDALONE UTILS REPLACEMENT
-// Insert this after your standard #include statements
-// ================================================================
-
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
-
-// Used in batched_moe_align_block_size
-template <typename T>
-__host__ __device__ inline T round_to_next_multiple_of(T x, T y) {
-  return ((x + y - 1) / y) * y;
-}
-
-// ================================================================
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
 namespace moe {
 
-// Note num_threads needs to be 1024 for BlockScan Reduction in the kernel.
-// static constexpr int32_t num_threads = 1024; not sure why these disappeared
-// static constexpr int32_t num_blocks = 1;
-
 template <typename scalar_t>
-__device__ void _moe_align_block_size(
+SGL_DEVICE void _moe_align_block_size(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ expert_ids,
@@ -69,7 +52,7 @@ __device__ void _moe_align_block_size(
   if (blockIdx.x % 2) {
     // Initialize sorted_token_ids with numel
     for (size_t it = threadIdx.x; it < max_num_tokens_padded; it += blockDim.x) {
-      sorted_token_ids[sorted_token_ids_offset + it] = numel;
+      sorted_token_ids[sorted_token_ids_offset + it] = static_cast<int32_t>(numel);
     }
     return;
   }
@@ -145,7 +128,7 @@ __device__ void _moe_align_block_size(
 }
 
 template <typename scalar_t, int32_t fill_threads>
-__device__ void _moe_align_block_size_small_batch_expert(
+SGL_DEVICE void _moe_align_block_size_small_batch_expert(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ expert_ids,
@@ -173,7 +156,7 @@ __device__ void _moe_align_block_size_small_batch_expert(
   if (threadIdx.x < fill_threads) {
     // Initialize sorted_token_ids with numel
     for (size_t it = threadIdx.x; it < max_num_tokens_padded; it += fill_threads) {
-      sorted_token_ids[sorted_token_ids_offset + it] = numel;
+      sorted_token_ids[sorted_token_ids_offset + it] = static_cast<int32_t>(numel);
     }
     // Three __syncthreads() corresponding to the other threads
     __syncthreads();
@@ -255,7 +238,7 @@ __device__ void _moe_align_block_size_small_batch_expert(
 }
 
 template <typename scalar_t>
-__device__ void _count_and_sort_expert_tokens(
+SGL_DEVICE void _count_and_sort_expert_tokens(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ cumsum_buffer,
@@ -319,38 +302,34 @@ __global__ void moe_lora_align_block_size_kernel(
     return;
   }
 
-  // Populate the token_mask based on the token-LoRA mapping
   int num_tokens = numel / topk_num;
   int lora_offset = lora_id * num_tokens;
 
-  // 1. Parallel Clear (Reset mask to 0)
-  // All threads help clear the mask for this adapter
-  for (int i = threadIdx.x; i < num_tokens; i += blockDim.x) {
-    token_mask[lora_offset + i] = 0;
-  }
+  if (blockIdx.x % 2 == 0) {
+    // 1. Parallel Clear (Reset mask to 0)
+    for (int i = threadIdx.x; i < num_tokens; i += blockDim.x) {
+      token_mask[lora_offset + i] = 0;
+    }
 
-  // Initialize output counter
-  if (threadIdx.x == 0) {
-    total_tokens_post_pad[lora_id] = 0;
-  }
+    if (threadIdx.x == 0) {
+      total_tokens_post_pad[lora_id] = 0;
+    }
 
-  __syncthreads();
+    __syncthreads();
 
-  // 2. Segment-based Fill
-  // Iterate over requests. If a request matches this LoRA, fill its range.
-  for (int r = 0; r < num_reqs; ++r) {
-    if (req_to_lora[r] == lora_id) {
-      int start = seg_indptr[r];
-      int end = seg_indptr[r + 1];
-
-      // Parallel Fill: All threads help mark this segment as "1"
-      for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
-        token_mask[lora_offset + i] = 1;
+    // 2. Segment-based Fill
+    for (int r = 0; r < num_reqs; ++r) {
+      if (req_to_lora[r] == lora_id) {
+        int start = seg_indptr[r];
+        int end = seg_indptr[r + 1];
+        for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+          token_mask[lora_offset + i] = 1;
+        }
       }
     }
-  }
 
-  __syncthreads();
+    __syncthreads();
+  }
 
   _moe_align_block_size(
       topk_ids,
@@ -385,10 +364,11 @@ __global__ void lora_count_and_sort_expert_tokens_kernel(
     int32_t topk_num,
     int32_t* token_mask,
     int32_t* lora_ids,
+    int32_t* adapter_enabled,
     bool has_expert_map) {
   int lora_idx = blockIdx.x;
   int lora_id = lora_ids[lora_idx];
-  if (lora_id == -1) {
+  if (lora_id == -1 || adapter_enabled[lora_id] == 0) {
     return;
   }
 
@@ -489,20 +469,7 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
 
 namespace {
 
-#define DISPATCH_TVM_INTEGRAL_TYPES(tvm_dtype_code, tvm_dtype_bits, c_type, ...)             \
-  [&]() -> bool {                                                                            \
-    if (tvm_dtype_code == kDLInt && tvm_dtype_bits == 32) {                                  \
-      using c_type = int32_t;                                                                \
-      return __VA_ARGS__();                                                                  \
-    }                                                                                        \
-    if (tvm_dtype_code == kDLInt && tvm_dtype_bits == 64) {                                  \
-      using c_type = int64_t;                                                                \
-      return __VA_ARGS__();                                                                  \
-    }                                                                                        \
-    host::RuntimeCheck(false, "Unsupported data type. Only int32 and int64 are supported."); \
-    return false;                                                                            \
-  }()
-
+template <typename scalar_t>
 struct MoeLoraAlignBlockSizeKernel {
   static void
   run(tvm::ffi::TensorView topk_ids,
@@ -547,111 +514,107 @@ struct MoeLoraAlignBlockSizeKernel {
     }
     int num_reqs = seg_indptr.size(0) - 1;
 
-    auto topk_ids_dtype = topk_ids.dtype();
+    bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
 
-    DISPATCH_TVM_INTEGRAL_TYPES(topk_ids_dtype.code, topk_ids_dtype.bits, scalar_t, [&] {
-      bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
-
-      if (small_batch_expert_mode) {
-        const int32_t num_thread = std::max((int32_t)num_experts, 128);
-        const int32_t shared_mem =
-            (num_thread + 1) * num_experts * sizeof(int32_t) + (num_experts + 1) * sizeof(int32_t);
-        if (shared_mem > device_max_shared_mem) {
-          RuntimeCheck(false, "Shared memory usage exceeds device limit.");
-        }
-
-        // threadIdx.x >= fill_threads: counting experts and aligning
-        // threadIdx.x < fill_threads: filling sorted_token_ids
-        constexpr int32_t fill_threads = 256;
-
-        dim3 blockDim(num_thread + fill_threads);
-        auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
-        RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
-
-        LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)(
-            kernel,
-            static_cast<scalar_t*>(topk_ids.data_ptr()),
-            static_cast<int32_t*>(seg_indptr.data_ptr()),
-            static_cast<int32_t*>(req_to_lora.data_ptr()),
-            num_reqs,
-            block_size,
-            expert_map_ptr,
-            num_experts,
-            max_loras,
-            topk_ids.numel(),
-            max_num_tokens_padded,
-            max_num_m_blocks,
-            static_cast<int32_t*>(sorted_token_ids.data_ptr()),
-            static_cast<int32_t*>(expert_ids.data_ptr()),
-            topk_num,
-            static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
-            static_cast<int32_t*>(adapter_enabled.data_ptr()),
-            static_cast<int32_t*>(lora_ids.data_ptr()),
-            token_mask_ptr,
-            has_expert_map);
-
-      } else {
-        int num_thread = 1024;
-        dim3 blockDim(num_thread);
-        size_t num_warps = CEILDIV(padded_num_experts, WARP_SIZE);
-
-        size_t shared_mem_size = num_warps * WARP_SIZE * sizeof(int32_t);
-
-        auto align_kernel = moe::moe_lora_align_block_size_kernel<scalar_t>;
-
-        // launch two threadblocks for each lora
-        // blockIdx.x % 2 == 0: counting experts and aligning
-        // blockIdx.x % 2 == 1: filling sorted_token_ids
-        LaunchKernel(dim3(max_loras * 2), blockDim, stream, shared_mem_size)(
-            align_kernel,
-            static_cast<scalar_t*>(topk_ids.data_ptr()),
-            static_cast<int32_t*>(seg_indptr.data_ptr()),
-            static_cast<int32_t*>(req_to_lora.data_ptr()),
-            num_reqs,
-            block_size,
-            expert_map_ptr,
-            num_experts,
-            max_loras,
-            topk_ids.numel(),
-            max_num_tokens_padded,
-            max_num_m_blocks,
-            static_cast<int32_t*>(sorted_token_ids.data_ptr()),
-            static_cast<int32_t*>(expert_ids.data_ptr()),
-            topk_num,
-            static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
-            static_cast<int32_t*>(adapter_enabled.data_ptr()),
-            static_cast<int32_t*>(cumsum_buffer.data_ptr()),
-            WARP_SIZE,
-            padded_num_experts,
-            static_cast<int32_t*>(lora_ids.data_ptr()),
-            token_mask_ptr,
-            has_expert_map);
-
-        const int block_threads = std::min(256, (int)num_thread);
-        const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
-
-        const int max_blocks = 65535;
-        const int actual_blocks = std::min(num_blocks, max_blocks);
-
-        dim3 gridDims(max_loras, actual_blocks);
-        auto sort_kernel = moe::lora_count_and_sort_expert_tokens_kernel<scalar_t>;
-
-        LaunchKernel(gridDims, dim3(block_threads), stream)(
-            sort_kernel,
-            static_cast<scalar_t*>(topk_ids.data_ptr()),
-            static_cast<int32_t*>(sorted_token_ids.data_ptr()),
-            static_cast<int32_t*>(cumsum_buffer.data_ptr()),
-            expert_map_ptr,
-            topk_ids.numel(),
-            num_experts,
-            max_num_tokens_padded,
-            topk_num,
-            token_mask_ptr,
-            static_cast<int32_t*>(lora_ids.data_ptr()),
-            has_expert_map);
+    if (small_batch_expert_mode) {
+      const int32_t num_thread = std::max((int32_t)num_experts, 128);
+      const int32_t shared_mem =
+          (num_thread + 1) * num_experts * sizeof(int32_t) + (num_experts + 1) * sizeof(int32_t);
+      if (shared_mem > device_max_shared_mem) {
+        RuntimeCheck(false, "Shared memory usage exceeds device limit.");
       }
-      return true;
-    });
+
+      // threadIdx.x >= fill_threads: counting experts and aligning
+      // threadIdx.x < fill_threads: filling sorted_token_ids
+      constexpr int32_t fill_threads = 256;
+
+      dim3 blockDim(num_thread + fill_threads);
+      auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
+      RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
+
+      LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)(
+          kernel,
+          static_cast<scalar_t*>(topk_ids.data_ptr()),
+          static_cast<int32_t*>(seg_indptr.data_ptr()),
+          static_cast<int32_t*>(req_to_lora.data_ptr()),
+          num_reqs,
+          block_size,
+          expert_map_ptr,
+          num_experts,
+          max_loras,
+          topk_ids.numel(),
+          max_num_tokens_padded,
+          max_num_m_blocks,
+          static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+          static_cast<int32_t*>(expert_ids.data_ptr()),
+          topk_num,
+          static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
+          static_cast<int32_t*>(adapter_enabled.data_ptr()),
+          static_cast<int32_t*>(lora_ids.data_ptr()),
+          token_mask_ptr,
+          has_expert_map);
+
+    } else {
+      int num_thread = 1024;
+      dim3 blockDim(num_thread);
+      size_t num_warps = CEILDIV(padded_num_experts, WARP_SIZE);
+
+      size_t shared_mem_size = num_warps * WARP_SIZE * sizeof(int32_t);
+
+      auto align_kernel = moe::moe_lora_align_block_size_kernel<scalar_t>;
+
+      // launch two threadblocks for each lora
+      // blockIdx.x % 2 == 0: counting experts and aligning
+      // blockIdx.x % 2 == 1: filling sorted_token_ids
+      LaunchKernel(dim3(max_loras * 2), blockDim, stream, shared_mem_size)(
+          align_kernel,
+          static_cast<scalar_t*>(topk_ids.data_ptr()),
+          static_cast<int32_t*>(seg_indptr.data_ptr()),
+          static_cast<int32_t*>(req_to_lora.data_ptr()),
+          num_reqs,
+          block_size,
+          expert_map_ptr,
+          num_experts,
+          max_loras,
+          topk_ids.numel(),
+          max_num_tokens_padded,
+          max_num_m_blocks,
+          static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+          static_cast<int32_t*>(expert_ids.data_ptr()),
+          topk_num,
+          static_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
+          static_cast<int32_t*>(adapter_enabled.data_ptr()),
+          static_cast<int32_t*>(cumsum_buffer.data_ptr()),
+          WARP_SIZE,
+          padded_num_experts,
+          static_cast<int32_t*>(lora_ids.data_ptr()),
+          token_mask_ptr,
+          has_expert_map);
+
+      const int block_threads = std::min(256, (int)num_thread);
+      const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
+
+      const int max_blocks = 65535;
+      const int actual_blocks = std::min(num_blocks, max_blocks);
+
+      dim3 gridDims(max_loras, actual_blocks);
+      auto sort_kernel = moe::lora_count_and_sort_expert_tokens_kernel<scalar_t>;
+
+      LaunchKernel(gridDims, dim3(block_threads), stream)(
+          sort_kernel,
+          static_cast<scalar_t*>(topk_ids.data_ptr()),
+          static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+          static_cast<int32_t*>(cumsum_buffer.data_ptr()),
+          expert_map_ptr,
+          topk_ids.numel(),
+          num_experts,
+          max_num_tokens_padded,
+          topk_num,
+          token_mask_ptr,
+          static_cast<int32_t*>(lora_ids.data_ptr()),
+          static_cast<int32_t*>(adapter_enabled.data_ptr()),
+          has_expert_map);
+    }
   }
 };
 
