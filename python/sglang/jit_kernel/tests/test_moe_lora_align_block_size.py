@@ -70,6 +70,8 @@ def test_moe_lora_align_block_size(
     random.seed(1)
     torch.manual_seed(1)
 
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available, skipping moe_lora_align_block_size test.")
     # UPDATED: Get the new 3-step mapping tensors
     topk_ids, seg_indptr, req_to_lora = sample_data(
         num_experts, max_loras, num_tokens, topk_num
