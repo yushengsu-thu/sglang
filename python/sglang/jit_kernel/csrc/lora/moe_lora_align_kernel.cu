@@ -226,8 +226,7 @@ SGL_DEVICE void _moe_align_block_size_small_batch_expert(
       expert_id = expert_map[expert_id];
       if (expert_id < 0 || expert_id >= num_experts) continue;
     }
-    int32_t rank_post_pad =
-        tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
+    int32_t rank_post_pad = tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
 
     if (token_mask == nullptr || token_mask[i / topk_num]) {
       sorted_token_ids[sorted_token_ids_offset + rank_post_pad] = i;
