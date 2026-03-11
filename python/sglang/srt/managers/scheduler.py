@@ -20,6 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -30,7 +31,6 @@ import torch
 import torch.distributed
 import zmq
 from torch.cuda import Stream as CudaStream
-from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
@@ -202,6 +202,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     get_numa_node,
     get_zmq_socket,
+    is_mps,
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
@@ -218,6 +219,11 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+if is_mps():
+    CudaStreamContext = nullcontext
+else:
+    from torch.cuda import StreamContext as CudaStreamContext
 
 logger = logging.getLogger(__name__)
 
@@ -1498,7 +1504,7 @@ class Scheduler(
                     or not self.running_batch.is_empty()
                     or len(self.offload_tags) > 0
                 )
-                
+
                 # In PD disaggregation mode, also check if health check would be blocked
                 # in special queues (bootstrap/prealloc) due to external factors
                 will_block_in_pd_queue = False
@@ -1514,7 +1520,7 @@ class Scheduler(
                         len(self.disagg_decode_prealloc_queue.queue) > 0
                         or len(self.disagg_decode_transfer_queue.queue) > 0
                     )
-                
+
                 if has_running_requests or will_block_in_pd_queue:
                     self.return_health_check_ct += 1
                     continue
@@ -1776,7 +1782,7 @@ class Scheduler(
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = len(req.origin_input_ids)
             elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
