@@ -73,13 +73,12 @@ SGL_DEVICE void _moe_align_block_size(
 
   for (size_t i = tid; i < numel; i += stride) {
     int expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
+    if (expert_id < 0 || expert_id >= num_experts) {
       continue;
     }
     if (has_expert_map) {
       expert_id = expert_map[expert_id];
-      // filter invalid experts
-      if (expert_id == -1) continue;
+      if (expert_id < 0 || expert_id >= num_experts) continue;
     }
     int warp_idx = expert_id / experts_per_warp;
     int expert_offset = expert_id % experts_per_warp;
@@ -178,10 +177,10 @@ SGL_DEVICE void _moe_align_block_size_small_batch_expert(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
+    if (expert_id < 0 || expert_id >= num_experts) continue;
     if (has_expert_map) {
       expert_id = expert_map[expert_id];
-      // filter invalid expert
-      if (expert_id == -1) continue;
+      if (expert_id < 0 || expert_id >= num_experts) continue;
     }
     int mask = token_mask == nullptr ? 1 : token_mask[i / topk_num];
     tokens_cnts[(tid + 1) * num_experts + expert_id] += mask;
@@ -222,13 +221,13 @@ SGL_DEVICE void _moe_align_block_size_small_batch_expert(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
+    if (expert_id < 0 || expert_id >= num_experts) continue;
     if (has_expert_map) {
       expert_id = expert_map[expert_id];
-      // filter invalid expert
-      if (expert_id == -1) continue;
+      if (expert_id < 0 || expert_id >= num_experts) continue;
     }
     int32_t rank_post_pad =
-        tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];  // this is a culprit for bug
+        tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
 
     if (token_mask == nullptr || token_mask[i / topk_num]) {
       sorted_token_ids[sorted_token_ids_offset + rank_post_pad] = i;
