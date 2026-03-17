@@ -1,3 +1,4 @@
+from .chunked_embedding_lora_a import chunked_embedding_lora_a_forward
 from .chunked_sgmv_expand import chunked_sgmv_lora_expand_forward
 from .chunked_sgmv_shrink import chunked_sgmv_lora_shrink_forward
 from .embedding_lora_a import embedding_lora_a_fwd
@@ -15,5 +16,6 @@ __all__ = [
     "chunked_sgmv_lora_shrink_forward",
     "chunked_sgmv_lora_expand_forward",
     "fused_moe_lora",
+    "chunked_embedding_lora_a_forward",
     "embedding_lora_a_fwd",
 ]
