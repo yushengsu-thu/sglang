@@ -249,9 +249,7 @@ def use_torch(
 
         if mul_routed_weight:
             tensors = [
-                ((h_f32 @ la_f32[x].T @ lb_f32[x].T) * expert_weights[x]).to(
-                    orig_dtype
-                )
+                ((h_f32 @ la_f32[x].T @ lb_f32[x].T) * expert_weights[x]).to(orig_dtype)
                 for x in range(top_k_num)
             ]
         else:
