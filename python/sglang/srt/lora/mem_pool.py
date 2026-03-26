@@ -194,10 +194,7 @@ class LoRAMemoryPool:
         if self.is_moe_module(module_name):
             num_experts = self._get_num_experts(base_model)
             expert_dim = num_experts
-            if (
-                self.experts_shared_outer_loras
-                and module_name == "gate_up_proj_moe"
-            ):
+            if self.experts_shared_outer_loras and module_name == "gate_up_proj_moe":
                 expert_dim = 1
             return (
                 self.max_loras_per_batch,
@@ -250,10 +247,7 @@ class LoRAMemoryPool:
         if self.is_moe_module(module_name):
             num_experts = self._get_num_experts(base_model)
             expert_dim = num_experts
-            if (
-                self.experts_shared_outer_loras
-                and module_name == "down_proj_moe"
-            ):
+            if self.experts_shared_outer_loras and module_name == "down_proj_moe":
                 expert_dim = 1
             return (self.max_loras_per_batch, expert_dim, output_dim, max_lora_dim)
         else:
@@ -294,12 +288,9 @@ class LoRAMemoryPool:
             if hasattr(cfg, "get_text_config"):
                 cfg = cfg.get_text_config()
             has_shared_experts = (
-                (
-                    hasattr(cfg, "shared_expert_intermediate_size")
-                    and cfg.shared_expert_intermediate_size > 0
-                )
-                or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
-            )
+                hasattr(cfg, "shared_expert_intermediate_size")
+                and cfg.shared_expert_intermediate_size > 0
+            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
             has_moe = self._get_num_experts(base_model) > 1
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
@@ -627,10 +618,7 @@ class LoRAMemoryPool:
                 target_buffer = self.A_buffer[name][layer_id]
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
-                    if (
-                        self.experts_shared_outer_loras
-                        and name == "gate_up_proj_moe"
-                    ):
+                    if self.experts_shared_outer_loras and name == "gate_up_proj_moe":
                         if isinstance(weights, torch.Tensor) and weights.dim() == 3:
                             buffer_view = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
@@ -664,23 +652,16 @@ class LoRAMemoryPool:
                 target_buffer = self.B_buffer[name][layer_id]
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
-                    if (
-                        self.experts_shared_outer_loras
-                        and name == "down_proj_moe"
-                    ):
+                    if self.experts_shared_outer_loras and name == "down_proj_moe":
                         if isinstance(weights, torch.Tensor) and weights.dim() == 3:
-                            buffer_view = target_buffer[
-                                buffer_id, 0, :, :lora_rank
-                            ]
+                            buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
                             w = weights[0]
                             if w is not None:
                                 w = w * lora_adapter.scaling
                             load_lora_weight_tensor(buffer_view, w)
                         elif isinstance(weights, dict) and len(weights) > 0:
                             rep = next(iter(weights.values()))
-                            buffer_view = target_buffer[
-                                buffer_id, 0, :, :lora_rank
-                            ]
+                            buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
                             if rep is not None:
                                 rep = rep * lora_adapter.scaling
                             load_lora_weight_tensor(buffer_view, rep)
@@ -688,9 +669,7 @@ class LoRAMemoryPool:
                             target_buffer[buffer_id].zero_()
                     elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                         for eid in range(weights.shape[0]):
-                            buffer_view = target_buffer[
-                                buffer_id, eid, :, :lora_rank
-                            ]
+                            buffer_view = target_buffer[buffer_id, eid, :, :lora_rank]
                             w = weights[eid]
                             if w is not None:
                                 w = w * lora_adapter.scaling

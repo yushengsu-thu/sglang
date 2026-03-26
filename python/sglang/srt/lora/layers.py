@@ -857,12 +857,22 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         if self.tp_size <= 1:
             return A
         if isinstance(A, dict):
-            return {eid: self._slice_moe_a_2d(w, tp_rank, target_module) for eid, w in A.items()}
+            return {
+                eid: self._slice_moe_a_2d(w, tp_rank, target_module)
+                for eid, w in A.items()
+            }
         if isinstance(A, torch.Tensor) and A.dim() == 3:
-            return torch.stack([self._slice_moe_a_2d(A[i], tp_rank, target_module) for i in range(A.shape[0])])
+            return torch.stack(
+                [
+                    self._slice_moe_a_2d(A[i], tp_rank, target_module)
+                    for i in range(A.shape[0])
+                ]
+            )
         return self._slice_moe_a_2d(A, tp_rank, target_module)
 
-    def _slice_moe_a_2d(self, A: torch.Tensor, tp_rank: int, target_module: str) -> torch.Tensor:
+    def _slice_moe_a_2d(
+        self, A: torch.Tensor, tp_rank: int, target_module: str
+    ) -> torch.Tensor:
         if target_module == "down_proj_moe":
             shard_size = self.intermediate_size_per_partition
             start = tp_rank * shard_size
@@ -885,12 +895,22 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         if self.tp_size <= 1:
             return B
         if isinstance(B, dict):
-            return {eid: self._slice_moe_b_2d(w, tp_rank, target_module) for eid, w in B.items()}
+            return {
+                eid: self._slice_moe_b_2d(w, tp_rank, target_module)
+                for eid, w in B.items()
+            }
         if isinstance(B, torch.Tensor) and B.dim() == 3:
-            return torch.stack([self._slice_moe_b_2d(B[i], tp_rank, target_module) for i in range(B.shape[0])])
+            return torch.stack(
+                [
+                    self._slice_moe_b_2d(B[i], tp_rank, target_module)
+                    for i in range(B.shape[0])
+                ]
+            )
         return self._slice_moe_b_2d(B, tp_rank, target_module)
 
-    def _slice_moe_b_2d(self, B: torch.Tensor, tp_rank: int, target_module: str) -> torch.Tensor:
+    def _slice_moe_b_2d(
+        self, B: torch.Tensor, tp_rank: int, target_module: str
+    ) -> torch.Tensor:
         if target_module == "gate_up_proj_moe":
             shard_size = self.intermediate_size_per_partition
             start = tp_rank * shard_size

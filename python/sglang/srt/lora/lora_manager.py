@@ -731,7 +731,5 @@ class LoRAManager:
             ):
                 layer_id = get_layer_id(module_name)
                 lora_module = self.set_lora_module(module_name, module)
-                lora_module.experts_shared_outer_loras = (
-                    self.experts_shared_outer_loras
-                )
+                lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
                 self.lora_modules[layer_id][module_name] = lora_module

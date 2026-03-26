@@ -239,9 +239,7 @@ class LoRAAdapter(nn.Module):
                     ndim = weights[gate_up_name].dim()
                     repeat_dims = [1] * ndim
                     repeat_dims[ndim - 2] = 2
-                    weights[gate_up_name] = weights[gate_up_name].repeat(
-                        *repeat_dims
-                    )
+                    weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
                 # else: no-op as LoRA B weight is already stacked.
 
     def pin_weights_in_cpu(self):
