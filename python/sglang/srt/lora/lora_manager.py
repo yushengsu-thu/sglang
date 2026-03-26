@@ -36,8 +36,8 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
     LoRAType,
-    get_normalized_target_modules,
     auto_detect_lora_target_modules,
+    get_normalized_target_modules,
     get_target_module_name,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
