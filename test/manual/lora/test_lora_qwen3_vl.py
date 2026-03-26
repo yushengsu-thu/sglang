@@ -47,11 +47,15 @@ class TestLoRAQwen3VLGating(CustomTestCase):
         positives = (
             "model.layers.0.self_attn.qkv_proj",
             "model.layers.5.self_attn.o_proj",
+            "model.layers.0.mlp.experts",
+            "lm_head",
+            "model.embed_tokens",
         )
         negatives = (
             "model.layers.0.mlp.gate_up_proj",
             "model.layers.0.mlp.down_proj",
             "visual.blocks.0.attn.qkv_proj",
+            "visual.blocks.0.mlp.experts",
             "model.layers.x.self_attn.qkv_proj",
             "model.layers.0.attn.qkv_proj",
         )
