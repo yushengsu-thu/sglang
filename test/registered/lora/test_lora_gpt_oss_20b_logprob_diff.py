@@ -99,12 +99,8 @@ class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
                 weights_only=False,
             )
 
-            base_logprobs = get_prompt_logprobs(
-                engine, cdata["tokens"], lora_path=None
-            )
-            logprobs = get_prompt_logprobs(
-                engine, cdata["tokens"], lora_path="my_lora"
-            )
+            base_logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path=None)
+            logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path="my_lora")
 
             base_t = torch.tensor(base_logprobs)
             lora_t = torch.tensor(logprobs)

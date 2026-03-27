@@ -88,10 +88,16 @@ def get_hidden_dim(
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
         elif module_name == "gate_up_proj_moe":
-            moe_inter = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+            moe_inter = (
+                getattr(config, "moe_intermediate_size", None)
+                or config.intermediate_size
+            )
             return config.hidden_size, moe_inter * 2
         elif module_name == "down_proj_moe":
-            moe_inter = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+            moe_inter = (
+                getattr(config, "moe_intermediate_size", None)
+                or config.intermediate_size
+            )
             return moe_inter, config.hidden_size
         elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
