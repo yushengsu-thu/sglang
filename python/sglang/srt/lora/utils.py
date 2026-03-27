@@ -199,13 +199,18 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
     """
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
 
     raw_names: set = set()
     for name, module in model.named_modules():
         if isinstance(module, FusedMoE):
             raw_names.add("gate_up_proj")
             raw_names.add("down_proj")
+        elif isinstance(module, VocabParallelEmbedding):
+            raw_names.add("embed_tokens")
         elif isinstance(module, ParallelLMHead):
             raw_names.add("lm_head")
         elif isinstance(module, LinearBase):
