@@ -120,8 +120,10 @@ def get_normalized_target_modules(
     # Handle PEFT shorthand strings — return {"all"} as sentinel.
     # Callers can resolve to concrete names via auto_detect_lora_target_modules().
     if isinstance(target_modules, str):
-        if target_modules != "all":
-            raise ValueError("Only 'all' can be used as the string for target module")
+        if target_modules not in ["all", "all-linear"]:
+            raise ValueError(
+                "Only 'all' or 'all-linear' can be used as the string for target module"
+            )
         return {"all"}
 
     params_mapping = {
@@ -201,18 +203,13 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
     """
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        VocabParallelEmbedding,
-    )
+    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
     raw_names: set = set()
     for name, module in model.named_modules():
         if isinstance(module, FusedMoE):
             raw_names.add("gate_up_proj")
             raw_names.add("down_proj")
-        elif isinstance(module, VocabParallelEmbedding):
-            raw_names.add("embed_tokens")
         elif isinstance(module, ParallelLMHead):
             raw_names.add("lm_head")
         elif isinstance(module, LinearBase):
