@@ -88,9 +88,11 @@ def get_hidden_dim(
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
         elif module_name == "gate_up_proj_moe":
-            return config.hidden_size, config.moe_intermediate_size * 2
+            moe_inter = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+            return config.hidden_size, moe_inter * 2
         elif module_name == "down_proj_moe":
-            return config.moe_intermediate_size, config.hidden_size
+            moe_inter = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+            return moe_inter, config.hidden_size
         elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
             # if contain extra tokens will be added; otherwise is 0.
@@ -120,8 +122,6 @@ def get_normalized_target_modules(
     # Handle PEFT shorthand strings — return {"all"} as sentinel.
     # Callers can resolve to concrete names via auto_detect_lora_target_modules().
     if isinstance(target_modules, str):
-        if target_modules != "all":
-            raise ValueError("Only 'all' can be used as the string for target module")
         return {"all"}
 
     params_mapping = {
@@ -211,10 +211,10 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
         if isinstance(module, FusedMoE):
             raw_names.add("gate_up_proj")
             raw_names.add("down_proj")
-        elif isinstance(module, VocabParallelEmbedding):
-            raw_names.add("embed_tokens")
         elif isinstance(module, ParallelLMHead):
             raw_names.add("lm_head")
+        elif isinstance(module, VocabParallelEmbedding):
+            raw_names.add("embed_tokens")
         elif isinstance(module, LinearBase):
             raw_names.add(name.split(".")[-1])
 
