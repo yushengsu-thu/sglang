@@ -183,6 +183,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "o_proj",
         "gate_up_proj",
         "down_proj",
+        "embed_tokens",
         "lm_head",
     }
 )
