@@ -178,15 +178,11 @@ class TritonLoRABackend(BaseLoRABackend):
         num_experts = base.num_experts
 
         block_size_m = 64
-        max_num_tokens_padded = max_bs * top_k + num_experts * (
-            block_size_m - 1
-        )
+        max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
         max_num_tokens_padded = (
             (max_num_tokens_padded + block_size_m - 1) // block_size_m
         ) * block_size_m
-        max_num_m_blocks = (
-            max_num_tokens_padded + block_size_m - 1
-        ) // block_size_m
+        max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
 
         self.moe_cg_buffers = {
             "intermediate_cache1": torch.empty(
@@ -214,12 +210,8 @@ class TritonLoRABackend(BaseLoRABackend):
             "num_tokens_post_padded_lora": torch.empty(
                 (max_loras,), device=device, dtype=torch.int32
             ),
-            "adapter_enabled": torch.zeros(
-                max_loras, dtype=torch.int32, device=device
-            ),
-            "lora_ids": torch.arange(
-                max_loras, dtype=torch.int32, device=device
-            ),
+            "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
+            "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
             "cumsum_buffer": torch.zeros(
                 max_loras * (num_experts + 1),
                 dtype=torch.int32,

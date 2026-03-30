@@ -162,9 +162,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             has_active_lora = (
                 (
                     lora_info.adapter_enabled
-                    * (lora_info.lora_ranks > 0).to(
-                        lora_info.adapter_enabled.dtype
-                    )
+                    * (lora_info.lora_ranks > 0).to(lora_info.adapter_enabled.dtype)
                 )
                 .any()
                 .item()
@@ -228,9 +226,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         # Stage 1: Gate/Up projection (base)
         # ============================================================
         if cg is not None:
-            intermediate_cache1 = cg["intermediate_cache1"][
-                :M, : topk_ids.shape[1], :N
-            ]
+            intermediate_cache1 = cg["intermediate_cache1"][:M, : topk_ids.shape[1], :N]
         else:
             intermediate_cache1 = torch.empty(
                 (M, topk_ids.shape[1], N),
@@ -287,12 +283,8 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             sorted_token_ids_lora = cg["sorted_token_ids_lora"][
                 : max_loras * max_num_tokens_padded
             ]
-            expert_ids_lora = cg["expert_ids_lora"][
-                : max_loras * max_num_m_blocks
-            ]
-            num_tokens_post_padded_lora = cg[
-                "num_tokens_post_padded_lora"
-            ][:max_loras]
+            expert_ids_lora = cg["expert_ids_lora"][: max_loras * max_num_m_blocks]
+            num_tokens_post_padded_lora = cg["num_tokens_post_padded_lora"][:max_loras]
         else:
             sorted_token_ids_lora = torch.empty(
                 (max_loras * max_num_tokens_padded,),
@@ -311,9 +303,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         if cg is not None and "lora_ids" in cg:
             lora_ids = cg["lora_ids"][:max_loras]
         else:
-            lora_ids = torch.arange(
-                max_loras, dtype=torch.int32, device=device
-            )
+            lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
         moe_lora_align_block_size(
             topk_ids,
@@ -421,9 +411,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         elif inplace:
             out_hidden_states = hidden_states
         elif cg is not None:
-            out_hidden_states = cg["out_hidden_states"][
-                :M, : hidden_states.shape[1]
-            ]
+            out_hidden_states = cg["out_hidden_states"][:M, : hidden_states.shape[1]]
         else:
             out_hidden_states = torch.empty_like(hidden_states)
 
