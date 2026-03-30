@@ -856,29 +856,22 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         if self.tp_size <= 1:
             return A
+        if target_module != "down_proj_moe":
+            return A
         if isinstance(A, dict):
             return {
-                eid: self._slice_moe_a_2d(w, tp_rank, target_module)
+                eid: self._slice_moe_a(w, tp_rank, target_module)
                 for eid, w in A.items()
             }
-        if isinstance(A, torch.Tensor) and A.dim() == 3:
-            return torch.stack(
-                [
-                    self._slice_moe_a_2d(A[i], tp_rank, target_module)
-                    for i in range(A.shape[0])
-                ]
-            )
-        return self._slice_moe_a_2d(A, tp_rank, target_module)
+        return self._slice_moe_a(A, tp_rank, target_module)
 
-    def _slice_moe_a_2d(
+    def _slice_moe_a(
         self, A: torch.Tensor, tp_rank: int, target_module: str
     ) -> torch.Tensor:
-        if target_module == "down_proj_moe":
-            shard_size = self.intermediate_size_per_partition
-            start = tp_rank * shard_size
-            end = start + shard_size
-            return A[:, start:end].contiguous()
-        return A
+        shard_size = self.intermediate_size_per_partition
+        start = tp_rank * shard_size
+        end = start + shard_size
+        return A[..., start:end].contiguous()
 
     def slice_moe_lora_b_weights(self, B, tp_rank: int, target_module: str):
         """Slice LoRA B weights for MoE with TP.
@@ -893,6 +886,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
           down_proj_moe B:    [hidden_size, rank] — output is all-reduced, no slice
         """
         if self.tp_size <= 1:
+            return B
+        if target_module != "gate_up_proj_moe":
             return B
         if isinstance(B, dict):
             return {
