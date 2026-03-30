@@ -147,15 +147,28 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
     ):
-        """Initialize the batch info for CUDA Graph mode.
+        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
-        This method provides a hook for each backend to conduct its own initialization
-        logic for CUDA Graph mode.
+        Called during CudaGraphRunner.__init__(), after init_memory_pool().
 
         Args:
-            cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
             num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
+        """
+        pass
+
+    def init_cuda_graph_moe_buffers(
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype: torch.dtype,
+        moe_layer,
+    ):
+        """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
+
+        Called once before init_memory_pool() with a representative MoE layer
+        to extract dimensions.  All FusedMoEWithLoRA layers share the same
+        buffers since they execute sequentially during forward.
         """
         pass
 

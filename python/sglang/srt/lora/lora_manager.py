@@ -102,10 +102,30 @@ class LoRAManager:
     def init_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
     ):
+        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
+
+        Called during CudaGraphRunner.__init__(), after init_memory_pool().
+        Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
+        """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
+        )
+
+    def init_cuda_graph_moe_buffers(
+        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+    ):
+        """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
+
+        Called before init_memory_pool() so memory profiling accounts for them.
+        Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
+        """
+        self.lora_backend.init_cuda_graph_moe_buffers(
+            max_bs=max_bs,
+            max_loras=max_loras,
+            compute_dtype=compute_dtype,
+            moe_layer=moe_layer,
         )
 
     def create_lora_update_result(
