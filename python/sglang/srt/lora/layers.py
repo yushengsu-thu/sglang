@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -842,7 +842,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
         return B
 
-    def slice_moe_lora_a_weights(self, A, tp_rank: int, target_module: str):
+    def slice_moe_lora_a_weights(
+        self,
+        A: Union[torch.Tensor, Dict[int, torch.Tensor]],
+        tp_rank: int,
+        target_module: str,
+    ):
         """Slice LoRA A weights for MoE with TP.
 
         Accepts:
@@ -873,7 +878,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         end = start + shard_size
         return A[..., start:end].contiguous()
 
-    def slice_moe_lora_b_weights(self, B, tp_rank: int, target_module: str):
+    def slice_moe_lora_b_weights(
+        self,
+        B: Union[torch.Tensor, Dict[int, torch.Tensor]],
+        tp_rank: int,
+        target_module: str,
+    ):
         """Slice LoRA B weights for MoE with TP.
 
         Accepts:
