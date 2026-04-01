@@ -36,14 +36,14 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=300,
-    suite="stage-c-test-8-gpu-h200",
+    suite="stage-c-test-4-gpu-b200",
 )
 
 BASE_MODEL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-VL-30B-A3B-Instruct"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
-TP_SIZE = 8
+TP_SIZE = 4
 DISABLE_CUDA_GRAPH = True
 MOE_RUNNER_BACKEND = "triton"
 EXPERTS_SHARED_OUTER_LORAS = True

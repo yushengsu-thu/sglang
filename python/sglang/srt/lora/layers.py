@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -838,7 +838,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
         return B
 
-    def slice_moe_lora_a_weights(self, A, tp_rank: int, target_module: str):
+    def slice_moe_lora_a_weights(
+        self,
+        A: Union[torch.Tensor, Dict[int, torch.Tensor]],
+        tp_rank: int,
+        target_module: str,
+    ):
         """Slice LoRA A weights for MoE with TP.
 
         Accepts:
@@ -852,36 +857,29 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         if self.tp_size <= 1:
             return A
+        if target_module != "down_proj_moe":
+            return A
         if isinstance(A, dict):
             return {
-                eid: self._slice_moe_a_2d(w, tp_rank, target_module)
+                eid: self._slice_moe_a(w, tp_rank, target_module)
                 for eid, w in A.items()
             }
-        if isinstance(A, torch.Tensor) and A.dim() == 3:
-            return torch.stack(
-                [
-                    self._slice_moe_a_2d(A[i], tp_rank, target_module)
-                    for i in range(A.shape[0])
-                ]
-            )
-        return self._slice_moe_a_2d(A, tp_rank, target_module)
+        return self._slice_moe_a(A, tp_rank, target_module)
 
-    def _slice_moe_a_2d(
+    def _slice_moe_a(
         self, A: torch.Tensor, tp_rank: int, target_module: str
     ) -> torch.Tensor:
-        if target_module == "down_proj_moe":
-            shard_size = self.intermediate_size_per_partition
-            start = tp_rank * shard_size
-            end = start + shard_size
-            return A[:, start:end].contiguous()
-        return A
+        shard_size = self.intermediate_size_per_partition
+        start = tp_rank * shard_size
+        end = start + shard_size
+        return A[..., start:end].contiguous()
 
-    @property
-    def _uses_interleaved_gate_up(self) -> bool:
-        cfg = getattr(self.base_layer, "moe_runner_config", None)
-        return getattr(cfg, "gemm1_alpha", None) is not None
-
-    def slice_moe_lora_b_weights(self, B, tp_rank: int, target_module: str):
+    def slice_moe_lora_b_weights(
+        self,
+        B: Union[torch.Tensor, Dict[int, torch.Tensor]],
+        tp_rank: int,
+        target_module: str,
+    ):
         """Slice LoRA B weights for MoE with TP.
 
         Accepts:
@@ -897,6 +895,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             target_module == "gate_up_proj_moe" and self._uses_interleaved_gate_up
         )
         if not needs_processing:
+            return B
+        if target_module != "gate_up_proj_moe":
             return B
         if isinstance(B, dict):
             return {
