@@ -715,6 +715,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.intermediate_size_per_partition = getattr(
             base_layer, "intermediate_size_per_partition", None
         )
+        self._uses_interleaved_gate_up = (
+            getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
+        )
 
         # initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
