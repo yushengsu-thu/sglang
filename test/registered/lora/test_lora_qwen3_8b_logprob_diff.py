@@ -39,7 +39,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=200,
-    suite="stage-b-test-1-gpu-large",
+    suite="stage-c-test-1-gpu-b200",
 )
 
 BASE_MODEL = "Qwen/Qwen3-8B"
@@ -48,10 +48,10 @@ LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 1
 DISABLE_CUDA_GRAPH = True
-PREFILL_ATTENTION_BACKEND = "fa3"
-DECODE_ATTENTION_BACKEND = "fa3"
+PREFILL_ATTENTION_BACKEND = "fa4"
+DECODE_ATTENTION_BACKEND = "fa4"
 
-KL_THRESHOLD = 1e-2
+KL_THRESHOLD = 1e-3
 
 
 def kl_v2(a, b):

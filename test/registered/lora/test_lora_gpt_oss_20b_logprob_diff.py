@@ -36,21 +36,21 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=300,
-    suite="stage-c-test-8-gpu-h200",
+    suite="stage-c-test-4-gpu-b200",
 )
 
 BASE_MODEL = "lmsys/gpt-oss-20b-bf16"
 LORA_HF_REPO = "yushengsu/lora-diff-gpt-oss-20b"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
-TP_SIZE = 8
+TP_SIZE = 4
 DISABLE_CUDA_GRAPH = True
 MOE_RUNNER_BACKEND = "triton"
 EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "fa4"
 
-KL_THRESHOLD = 1e-2
+KL_THRESHOLD = 1e-3
 
 
 def kl_v2(a, b):
