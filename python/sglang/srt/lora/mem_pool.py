@@ -631,7 +631,11 @@ class LoRAMemoryPool:
                             ]
                             load_lora_weight_tensor(buffer_view, rep)
                         else:
-                            target_buffer[buffer_id].zero_()
+                            raise ValueError(
+                                f"Unexpected weight format for shared outer gate_up_proj_moe lora_A: "
+                                f"type={type(weights)}, "
+                                f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
+                            )
                     elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                         for eid in range(weights.shape[0]):
                             buffer_view = target_buffer[
@@ -666,7 +670,11 @@ class LoRAMemoryPool:
                                 rep = rep * lora_adapter.scaling
                             load_lora_weight_tensor(buffer_view, rep)
                         else:
-                            target_buffer[buffer_id].zero_()
+                            raise ValueError(
+                                f"Unexpected weight format for shared outer down_proj_moe lora_B: "
+                                f"type={type(weights)}, "
+                                f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
+                            )
                     elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                         for eid in range(weights.shape[0]):
                             buffer_view = target_buffer[buffer_id, eid, :, :lora_rank]

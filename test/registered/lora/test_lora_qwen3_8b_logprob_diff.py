@@ -26,11 +26,14 @@ Usage:
 import multiprocessing as mp
 import os
 import unittest
+from unittest.mock import patch
 
 import torch
+import torch.nn as nn
 from huggingface_hub import snapshot_download
 
 import sglang as sgl
+from sglang.srt.lora.utils import auto_detect_lora_target_modules
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -45,8 +48,8 @@ LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 1
 DISABLE_CUDA_GRAPH = True
-PREFILL_ATTENTION_BACKEND = "fa4"
-DECODE_ATTENTION_BACKEND = "fa4"
+PREFILL_ATTENTION_BACKEND = "fa3"
+DECODE_ATTENTION_BACKEND = "fa3"
 
 KL_THRESHOLD = 1e-2
 
@@ -68,7 +71,59 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
+class _MockLinearBase(nn.Module):
+    pass
+
+
+class _MockFusedMoE(nn.Module):
+    pass
+
+
+class _MockParallelLMHead(nn.Module):
+    pass
+
+
+def _build_qwen3_mock():
+    """Build a lightweight nn.Module tree that mirrors Qwen3-8B's named modules."""
+    model = nn.Module()
+    inner = nn.Module()
+    layer = nn.Module()
+
+    attn = nn.Module()
+    attn.qkv_proj = _MockLinearBase()
+    attn.o_proj = _MockLinearBase()
+    layer.self_attn = attn
+
+    mlp = nn.Module()
+    mlp.gate_up_proj = _MockLinearBase()
+    mlp.down_proj = _MockLinearBase()
+    layer.mlp = mlp
+
+    inner.layers = nn.ModuleList([layer])
+    inner.embed_tokens = nn.Embedding(10, 8)  # not a LinearBase — should be excluded
+    model.model = inner
+    model.lm_head = _MockParallelLMHead()
+    return model
+
+
 class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
+
+    def test_auto_detect_lora_target_modules(self):
+        """Verify auto_detect_lora_target_modules returns the expected module
+        set for a Qwen3-8B-like (dense) architecture.  Catches silent renames
+        of internal param names that would break LoRA auto-detection."""
+        model = _build_qwen3_mock()
+
+        with patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase), patch(
+            "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
+        ), patch(
+            "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
+            _MockParallelLMHead,
+        ):
+            detected = auto_detect_lora_target_modules(model)
+
+        expected = {"qkv_proj", "o_proj", "gate_up_proj", "down_proj", "lm_head"}
+        self.assertEqual(detected, expected)
 
     def test_lora_qwen3_8b_logprob_accuracy(self):
         adapter_path = snapshot_download(
