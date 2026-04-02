@@ -765,13 +765,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             adapter_enabled = cg_buffers["adapter_enabled"]
             adapter_enabled.zero_()
             adapter_enabled.index_fill_(
-                0, batch_info.weight_indices[: batch_info.bs].long(), 1
+                0, batch_info.weight_indices[: batch_info.bs], 1
             )
         else:
             adapter_enabled = torch.zeros(
                 len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
             )
-            adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
+            adapter_enabled.index_fill_(0, batch_info.weight_indices, 1)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
@@ -786,6 +786,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             num_experts=self.base_layer.num_experts,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
+            has_active_lora=batch_info.has_active_lora,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),

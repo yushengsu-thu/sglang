@@ -44,6 +44,10 @@ class LoRABatchInfo:
     # Used by lm_head LoRA to validate input shape without GPU sync.
     expected_tokens: Optional[int] = None
 
+    # CPU-side flag: True when at least one request uses a LoRA adapter.
+    # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
+    has_active_lora: bool = False
+
 
 class LoRAType(Enum):
     LORA_A = 0

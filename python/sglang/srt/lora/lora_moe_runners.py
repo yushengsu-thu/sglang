@@ -103,6 +103,7 @@ class LoRAInfo:
     num_experts: int
     experts_shared_outer_loras: bool = False
     cg_buffers: Optional[dict] = None
+    has_active_lora: bool = False
 
     fully_sharded: bool = False
     tp_size: int = 1
@@ -159,14 +160,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             # in-place with the real adapter mask before graph.replay().
             has_active_lora = True
         else:
-            has_active_lora = (
-                (
-                    lora_info.adapter_enabled
-                    * (lora_info.lora_ranks > 0).to(lora_info.adapter_enabled.dtype)
-                )
-                .any()
-                .item()
-            )
+            has_active_lora = lora_info.has_active_lora
         if not has_active_lora:
             return super().run(runner_input, quant_info, running_state)
 

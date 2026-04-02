@@ -317,6 +317,9 @@ class LoRAManager:
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
         )
+        self.lora_backend.batch_info.has_active_lora = any(
+            lora_ranks[wi] > 0 for wi in weight_indices
+        )
 
     def update_lora_info(self):
         """
@@ -464,8 +467,13 @@ class LoRAManager:
         dim[0]=1 indicates weights shared across all experts, while
         dim[0]=num_experts indicates per-expert weights.
         Returns True if gate_up lora_A has expert_dim=1 (shared).
+
+        All loaded adapters that expose a 3D gate_up lora_A must agree;
+        mixed formats raise RuntimeError.
         """
-        for adapter in self.loras.values():
+        shared_outer: Optional[bool] = None
+        for adapter_id, adapter in self.loras.items():
+            found = False
             for layer in adapter.layers:
                 for name, weight in layer.weights.items():
                     if (
@@ -473,9 +481,21 @@ class LoRAManager:
                         and "lora_A" in name
                         and weight.dim() == 3
                     ):
-                        return weight.shape[0] == 1
-            break
-        return False
+                        is_shared = weight.shape[0] == 1
+                        if shared_outer is None:
+                            shared_outer = is_shared
+                        elif shared_outer != is_shared:
+                            raise RuntimeError(
+                                "Mixed shared-outer LoRA formats detected across "
+                                f"loaded adapters (conflict in adapter '{adapter_id}'). "
+                                "All MoE adapters must either all use shared outer "
+                                "experts (expert_dim=1) or all use per-expert weights."
+                            )
+                        found = True
+                        break
+                if found:
+                    break
+        return bool(shared_outer) if shared_outer is not None else False
 
     def init_lora_shapes(
         self,
