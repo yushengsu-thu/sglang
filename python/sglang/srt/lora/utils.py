@@ -128,6 +128,10 @@ def get_normalized_target_modules(
     # Handle PEFT shorthand strings — return {"all"} as sentinel.
     # Callers can resolve to concrete names via auto_detect_lora_target_modules().
     if isinstance(target_modules, str):
+        if target_modules not in ["all", "all-linear"]:
+            raise ValueError(
+                "Only 'all' or 'all-linear' can be used as the string for target module"
+            )
         return {"all"}
 
     params_mapping = {
