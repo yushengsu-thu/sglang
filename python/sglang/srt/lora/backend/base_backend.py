@@ -217,6 +217,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
                 (max_loras,), device=device, dtype=torch.int32
             ),
             "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
+            # int64 copy of weight_indices for index_fill_(), which requires
+            # LongTensor.  weight_indices itself must stay int32 because the
+            # CUDA moe_lora_align kernel casts it to int32_t*.
+            "weight_indices_long": torch.zeros(max_bs, dtype=torch.int64, device=device),
             "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
             "cumsum_buffer": torch.zeros(
                 max_loras * (num_experts + 1),

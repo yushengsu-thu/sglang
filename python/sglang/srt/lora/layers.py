@@ -764,14 +764,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         if cg_buffers is not None and batch_info.use_cuda_graph:
             adapter_enabled = cg_buffers["adapter_enabled"]
             adapter_enabled.zero_()
-            adapter_enabled.index_fill_(
-                0, batch_info.weight_indices[: batch_info.bs], 1
-            )
+            idx_buf = cg_buffers["weight_indices_long"]
+            idx_buf[: batch_info.bs] = batch_info.weight_indices[: batch_info.bs]
+            adapter_enabled.index_fill_(0, idx_buf[: batch_info.bs], 1)
         else:
             adapter_enabled = torch.zeros(
                 len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
             )
-            adapter_enabled.index_fill_(0, batch_info.weight_indices, 1)
+            adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
