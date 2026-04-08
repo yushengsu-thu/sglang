@@ -12,6 +12,7 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
+    REPLICATED_LINEAR_LORA_NAMES,
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
@@ -188,7 +189,11 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+        if (
+            self.tp_size > 1
+            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+        ):
             input_dim = divide(input_dim, self.tp_size)
 
         if self.is_moe_module(module_name):
@@ -240,7 +245,11 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+        if (
+            self.tp_size > 1
+            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+        ):
             output_dim = divide(output_dim, self.tp_size)
 
         # Check if MoE module and return appropriate shape
