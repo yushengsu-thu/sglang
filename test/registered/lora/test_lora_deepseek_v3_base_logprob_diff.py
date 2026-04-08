@@ -36,7 +36,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=300,
-    suite="stage-c-test-4-gpu-b200",
+    suite="nightly-8-gpu-b200",
 )
 
 BASE_MODEL = "deepseek-ai/DeepSeek-V3.1-Base"
