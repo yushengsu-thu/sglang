@@ -721,7 +721,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
-        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
         self._lora_runner = MoeRunner(
             base_layer.quant_method.runner.runner_backend,
@@ -730,11 +729,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
         # Pre-compute quant info for efficiency (weights don't change during inference)
-        self._quant_info = TritonMoeQuantInfo(
-            w13_weight=base_layer.w13_weight,
-            w2_weight=base_layer.w2_weight,
-            b13=getattr(base_layer, "w13_weight_bias", None),
-            b2=getattr(base_layer, "w2_weight_bias", None),
+        self._quant_info = base_layer.quant_method.get_triton_quant_info(
+            base_layer
         )
 
     def set_lora_info(
