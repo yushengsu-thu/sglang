@@ -107,9 +107,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> CombineInput:
         raise NotImplementedError
 
-    def get_triton_quant_info(
-        self, layer: torch.nn.Module
-    ) -> "TritonMoeQuantInfo":
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> "TritonMoeQuantInfo":
         """Return a ``TritonMoeQuantInfo`` describing the quantisation state
         stored on *layer*.
 

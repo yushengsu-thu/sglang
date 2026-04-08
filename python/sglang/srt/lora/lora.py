@@ -257,9 +257,7 @@ class LoRAAdapter(nn.Module):
 
             q_a_name = weight_name
             kv_a_name = weight_name.replace("q_a_proj", "kv_a_proj_with_mqa")
-            fused_name = weight_name.replace(
-                "q_a_proj", "fused_qkv_a_proj_with_mqa"
-            )
+            fused_name = weight_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
 
             kv_a_weight = (
                 weights[kv_a_name]
@@ -267,9 +265,7 @@ class LoRAAdapter(nn.Module):
                 else torch.zeros_like(weights[q_a_name])
             )
 
-            weights[fused_name] = torch.cat(
-                (weights[q_a_name], kv_a_weight), dim=0
-            )
+            weights[fused_name] = torch.cat((weights[q_a_name], kv_a_weight), dim=0)
             weights.pop(q_a_name)
             if kv_a_name in weights:
                 weights.pop(kv_a_name)

@@ -777,9 +777,7 @@ class LoRAManager:
                     continue
                 lora_module = self.set_lora_module(module_name, module)
                 if isinstance(lora_module, ReplicatedLinearWithLoRA):
-                    q_lora_rank = (
-                        getattr(self.base_hf_config, "q_lora_rank", None) or 0
-                    )
+                    q_lora_rank = getattr(self.base_hf_config, "q_lora_rank", None) or 0
                     lora_module.first_output_dim = q_lora_rank
                 self.lora_modules[layer_id][module_name] = lora_module
                 continue

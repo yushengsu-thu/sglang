@@ -818,9 +818,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
         # Pre-compute quant info for efficiency (weights don't change during inference)
-        self._quant_info = base_layer.quant_method.get_triton_quant_info(
-            base_layer
-        )
+        self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
 
     def set_lora_info(
         self,
