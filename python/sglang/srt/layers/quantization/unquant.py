@@ -594,7 +594,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             ), f"activation = {moe_runner_config.activation} is not supported \
             for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
 
-            quant_info = self.get_triton_quant_info(layer)
+            # quant_info = self.get_triton_quant_info(layer)
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+            )
             return self.runner.run(dispatch_output, quant_info)
 
     def forward_npu(
