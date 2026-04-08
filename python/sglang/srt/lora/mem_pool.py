@@ -628,7 +628,12 @@ class LoRAMemoryPool:
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     if self.experts_shared_outer_loras and name == "gate_up_proj_moe":
-                        if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                        if weights is None:
+                            buffer_view = target_buffer[
+                                buffer_id, 0, : lora_rank * c, :
+                            ]
+                            load_lora_weight_tensor(buffer_view, None)
+                        elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                             if weights.shape[0] != 1:
                                 raise ValueError(
                                     f"experts_shared_outer_loras is enabled but "
@@ -678,7 +683,10 @@ class LoRAMemoryPool:
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     if self.experts_shared_outer_loras and name == "down_proj_moe":
-                        if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                        if weights is None:
+                            buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
+                            load_lora_weight_tensor(buffer_view, None)
+                        elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                             if weights.shape[0] != 1:
                                 raise ValueError(
                                     f"experts_shared_outer_loras is enabled but "
