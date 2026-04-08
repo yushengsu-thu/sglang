@@ -113,18 +113,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
         The LoRA MoE runner calls this so that ``invoke_fused_moe_kernel``
         receives the correct flags / scales / block-shape for the base
-        weights.  Each quantisation method should override this with the
+        weights.  Each quantisation method must override this with the
         same construction it already uses inside ``apply()``.
-
-        The default returns an unquantised descriptor.
         """
-        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-
-        return TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            b13=getattr(layer, "w13_weight_bias", None),
-            b2=getattr(layer, "w2_weight_bias", None),
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_triton_quant_info()"
         )
 
 
