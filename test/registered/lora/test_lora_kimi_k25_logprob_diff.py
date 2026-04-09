@@ -52,6 +52,11 @@ DECODE_ATTENTION_BACKEND = "flashinfer"
 KL_THRESHOLD = 1e-2
 
 
+# Kimi-K2.5 checkpoint uses non-ue8m0 FP8 scales; DeepGemm's Blackwell
+# UE8M0 path causes measurable accuracy loss for this model.
+os.environ.setdefault("SGLANG_ENABLE_JIT_DEEPGEMM", "0")
+
+
 def kl_v2(a, b):
     a = torch.tensor(a) if not torch.is_tensor(a) else a
     b = torch.tensor(b) if not torch.is_tensor(b) else b
