@@ -49,12 +49,7 @@ EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "flashinfer"
 
-KL_THRESHOLD = 1e-2
-
-
-# Kimi-K2.5 checkpoint uses non-ue8m0 FP8 scales; DeepGemm's Blackwell
-# UE8M0 path causes measurable accuracy loss for this model.
-os.environ.setdefault("SGLANG_ENABLE_JIT_DEEPGEMM", "0")
+KL_THRESHOLD = 1.5e-2
 
 
 def kl_v2(a, b):
