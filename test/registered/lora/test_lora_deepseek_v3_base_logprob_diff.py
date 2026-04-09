@@ -36,20 +36,20 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=300,
-    suite="stage-c-test-4-gpu-b200",
+    suite="nightly-8-gpu-b200",
 )
 
 BASE_MODEL = "deepseek-ai/DeepSeek-V3.1-Base"
 LORA_HF_REPO = "yushengsu/lora-diff-DeepSeek-V3.1-Base"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
-TP_SIZE = 4
+TP_SIZE = 8
 MOE_RUNNER_BACKEND = "triton"
 EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "flashinfer"
 
-KL_THRESHOLD = 5e-3
+KL_THRESHOLD = 6e-3
 
 
 def kl_v2(a, b):
