@@ -661,12 +661,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
                 input_parallel, self.A_buffer
             )
-            # Fuse two all-reduce into one: cat → all-reduce → split
-            combined = torch.cat([output_parallel, lora_a_output], dim=-1)
-            combined = tensor_model_parallel_all_reduce(combined)
-            output_dim = output_parallel.shape[-1]
-            output_ = combined[:, :output_dim].contiguous()
-            lora_a_output = combined[:, output_dim:].contiguous()
+            output_ = tensor_model_parallel_all_reduce(output_parallel)
+            lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
             output_ = self.lora_backend.run_lora_b_sgemm(
                 x=lora_a_output,
                 weights=self.B_buffer,
