@@ -349,14 +349,6 @@ def _add_lora_gate_up_delta(
     r = lora_info.max_lora_rank
     gate_up_a = lora_info.gate_up_lora_a_weights
     gate_up_b = lora_info.gate_up_lora_b_weights
-<<<<<<< HEAD
-    inter_size = gate_up_b.shape[2] // 2
-
-    if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
-        gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
-    lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
-    lora_b_stacked = [gate_up_b[:, :, :inter_size, :], gate_up_b[:, :, inter_size:, :]]
-=======
 
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
@@ -374,7 +366,6 @@ def _add_lora_gate_up_delta(
     else:
         lora_a_stacked = [gate_up_a]
         lora_b_stacked = [gate_up_b]
->>>>>>> upstream/main
 
     if lora_info.lora_use_virtual_experts:
         merged_experts_fused_moe_lora_add(
