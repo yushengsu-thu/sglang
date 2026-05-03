@@ -69,6 +69,8 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
 
@@ -1248,7 +1250,11 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         if (
             is_cpu()
-            and loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+            and (
+                loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+                or loaded_weight.size(0)
+                < get_tensor_model_parallel_world_size() * shard_size
+            )
             and loaded_weight.dim() == 1
         ):
             param_data = param.data  # view copy on param for uneven padding
@@ -1313,7 +1319,9 @@ def runai_safetensors_weights_iterator(
             mininterval=2,
         )
 
-        yield from tensor_iter
+        for name, tensor in tensor_iter:
+            setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+            yield name, tensor
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
@@ -1623,3 +1631,33 @@ def narrow_padded_param_and_loaded_weight(
     param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
 
     return param_data, loaded_weight
+
+
+def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
+    # This function is for padding zeros when loaded_weight is less than output_sizes.
+    # Most cases, sum(output_sizes) = loaded_weight.size(output_dim),
+    # while in some TP cases like TP6, output_sizes will be padded, thus loaded_weight needs padding.
+    total_output_size = sum(output_sizes)
+    raw_output_size = loaded_weight.size(output_dim)
+    if total_output_size > raw_output_size:
+        loaded_weight_pad = []
+        weight_split_size = [
+            int(output_size / total_output_size * raw_output_size)
+            for output_size in output_sizes
+        ]
+        assert (
+            sum(weight_split_size) == raw_output_size
+        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+
+        split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
+        for i, output_size in enumerate(output_sizes):
+            pad_size = output_size - weight_split_size[i]
+            target_pad_shape = list(loaded_weight.size())
+            target_pad_shape[output_dim] = pad_size
+            pad_tensor = torch.zeros(target_pad_shape).to(loaded_weight.dtype)
+            loaded_weight_pad.append(
+                torch.cat([split_weight[i], pad_tensor], dim=output_dim)
+            )
+        return torch.cat(loaded_weight_pad, dim=output_dim)
+    else:
+        return loaded_weight
