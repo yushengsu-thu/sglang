@@ -9,9 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.moe_align import (
-    moe_align_block_size as jit_moe_align_block_size,
-)
+from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
 
 
 @triton.jit
@@ -457,8 +455,10 @@ def _align_block_size_jit(
     # Single allocation sliced into 4 views (zero-copy) to avoid
     # per-call Python overhead of 4 separate torch.empty calls.
     total_buf = (
-        max_num_tokens_padded + max_num_m_blocks_padded
-        + num_post_pad_size + cumsum_size
+        max_num_tokens_padded
+        + max_num_m_blocks_padded
+        + num_post_pad_size
+        + cumsum_size
     )
     buf = torch.empty(total_buf, dtype=torch.int32, device=device)
     off = 0
