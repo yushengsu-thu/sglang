@@ -9,6 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.moe_align import (
+    moe_align_block_size as jit_moe_align_block_size,
+)
+
 
 @triton.jit
 def _fused_virtual_topk_ids_kernel(
@@ -415,8 +419,9 @@ def _align_block_size_jit(
     handles histogram, padded prefix-sum, expert_ids assignment, and token
     scattering in just 2–3 CUDA kernel launches.
     """
-    from sglang.jit_kernel.moe_align import (
-        moe_align_block_size as jit_moe_align_block_size,
+    assert num_experts <= 8191, (
+        f"_align_block_size_jit supports at most 8191 experts "
+        f"(num_moe_experts * max_loras), got {num_experts}"
     )
 
     device = topk_ids.device
@@ -424,6 +429,10 @@ def _align_block_size_jit(
     if flat_topk_ids.dtype == torch.int64:
         flat_topk_ids = flat_topk_ids.to(torch.int32)
     num_total_tokens = flat_topk_ids.numel()
+
+    if num_total_tokens == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=device)
+        return empty, empty, torch.zeros(1, dtype=torch.int32, device=device)
 
     # JIT kernel uses +1 offset convention: -1 -> bucket 0 (sentinel),
     # expert i -> bucket i+1. So pass num_experts + 1 as the bucket count.
@@ -434,17 +443,32 @@ def _align_block_size_jit(
     else:
         max_num_tokens_padded = num_total_tokens + jit_num_experts * (block_size - 1)
 
-    sorted_token_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=device
+    # Align every sub-buffer offset to a multiple of 4 (VEC_SIZE). The CUDA
+    # kernel fills sorted_token_ids with vectorized int4 writes whose last
+    # store can spill up to 3 int32s past the logical end. With a fused
+    # allocation the spill would corrupt the adjacent sub-buffer.
+    _A4 = lambda n: (n + 3) & ~3  # noqa: E731
+    max_num_tokens_padded = _A4(max_num_tokens_padded)
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+    max_num_m_blocks_padded = _A4(max_num_m_blocks)
+    num_post_pad_size = _A4(1)  # 1 element, padded to 4
+    cumsum_size = _A4(jit_num_experts + 1)
+
+    # Single allocation sliced into 4 views (zero-copy) to avoid
+    # per-call Python overhead of 4 separate torch.empty calls.
+    total_buf = (
+        max_num_tokens_padded + max_num_m_blocks_padded
+        + num_post_pad_size + cumsum_size
     )
-    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=torch.int32, device=device
-    )
-    num_tokens_post_padded = torch.empty((1,), dtype=torch.int32, device=device)
-    cumsum_buffer = torch.empty(
-        (jit_num_experts + 1,), dtype=torch.int32, device=device
-    )
+    buf = torch.empty(total_buf, dtype=torch.int32, device=device)
+    off = 0
+    sorted_token_ids = buf[off : off + max_num_tokens_padded]
+    off += max_num_tokens_padded
+    expert_ids = buf[off : off + max_num_m_blocks]
+    off += max_num_m_blocks_padded
+    num_tokens_post_padded = buf[off : off + 1]
+    off += num_post_pad_size
+    cumsum_buffer = buf[off : off + jit_num_experts + 1]
 
     jit_moe_align_block_size(
         flat_topk_ids,
@@ -454,7 +478,7 @@ def _align_block_size_jit(
         expert_ids,
         num_tokens_post_padded,
         cumsum_buffer,
-        True,
+        True,  # pad_sorted_token_ids
     )
 
     return sorted_token_ids, expert_ids, num_tokens_post_padded
