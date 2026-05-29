@@ -1917,13 +1917,31 @@ def get_tensor_info(x):
 _LORA_MOE_SHAPE_DUMP_COUNTS: dict = {}
 
 
+def _tensor_shape_info(x):
+    """Sync-free metadata: shape/dtype/device/stride only (no min/max/mean/sample).
+
+    Unlike get_tensor_info this does NOT touch tensor *values*, so it never forces a
+    D2H sync. That matters when dumping mid-forward under TP + allreduce-fusion + side
+    streams, where a forced sync deadlocks against in-flight collectives.
+    """
+    import torch
+
+    if not isinstance(x, torch.Tensor):
+        return f"type={type(x).__name__} value={x}"
+    return (
+        f"shape={tuple(x.shape)} dtype={x.dtype} device={x.device} "
+        f"stride={x.stride()} contig={x.is_contiguous()}"
+    )
+
+
 def maybe_dump_lora_moe_shapes(tag, **tensors):
     """Dump shape/dtype/stride for MoE-LoRA kernel call sites.
 
     Gated by ``SGLANG_DEBUG_LORA_MOE_SHAPES`` (int): each ``tag`` is dumped at most
     that many times, then goes quiet (0 = off). Used by the lora_moe_overlap testbed
     to capture faithful (EP-sharded, FP8) production shapes for the shrink/expand
-    kernels. Cheap when disabled (one int read).
+    kernels. Cheap when disabled (one int read); SYNC-FREE when enabled so it is safe
+    to call mid-forward in multi-GPU serving.
     """
     from sglang.srt.environ import envs
 
@@ -1936,5 +1954,5 @@ def maybe_dump_lora_moe_shapes(tag, **tensors):
     _LORA_MOE_SHAPE_DUMP_COUNTS[tag] = seen + 1
     lines = [f"[LORA_MOE_SHAPES] tag={tag} call#{seen}"]
     for name, value in tensors.items():
-        lines.append(f"  {name}: {get_tensor_info(value)}")
+        lines.append(f"  {name}: {_tensor_shape_info(value)}")
     print("\n".join(lines), flush=True)
