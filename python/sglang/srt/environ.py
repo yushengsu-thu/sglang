@@ -236,6 +236,11 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # When set, dump tensor shape/dtype/stride (via debug_utils.get_tensor_info) for the
+    # MoE-LoRA shrink/expand kernel call sites. Used by the lora_moe_overlap testbed to
+    # capture faithful (EP-sharded, FP8) production shapes. Value = number of calls to dump
+    # per kernel before it goes quiet (0 = off).
+    SGLANG_DEBUG_LORA_MOE_SHAPES = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)

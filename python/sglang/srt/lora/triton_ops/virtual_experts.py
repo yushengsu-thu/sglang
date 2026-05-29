@@ -258,6 +258,20 @@ def _invoke_moe_lora_shrink_splitk(
     config: dict[str, Any],
 ) -> None:
     """Launch split-K shrink kernel for LoRA A with few virtual experts."""
+    from sglang.srt.debug_utils.dumper import maybe_dump_lora_moe_shapes
+
+    maybe_dump_lora_moe_shapes(
+        "shrink_splitk",
+        hidden_states=hidden_states,
+        weight=weight,
+        output=output,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        top_k=top_k,
+    )
+
     N = weight.shape[1]
     K = weight.shape[2]
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]

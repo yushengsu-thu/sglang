@@ -1912,3 +1912,29 @@ def get_tensor_info(x):
         f"x_sample_head={x_sample_head} "
         f"x_sample_tail={x_sample_tail}"
     )
+
+
+_LORA_MOE_SHAPE_DUMP_COUNTS: dict = {}
+
+
+def maybe_dump_lora_moe_shapes(tag, **tensors):
+    """Dump shape/dtype/stride for MoE-LoRA kernel call sites.
+
+    Gated by ``SGLANG_DEBUG_LORA_MOE_SHAPES`` (int): each ``tag`` is dumped at most
+    that many times, then goes quiet (0 = off). Used by the lora_moe_overlap testbed
+    to capture faithful (EP-sharded, FP8) production shapes for the shrink/expand
+    kernels. Cheap when disabled (one int read).
+    """
+    from sglang.srt.environ import envs
+
+    budget = envs.SGLANG_DEBUG_LORA_MOE_SHAPES.get()
+    if not budget:
+        return
+    seen = _LORA_MOE_SHAPE_DUMP_COUNTS.get(tag, 0)
+    if seen >= budget:
+        return
+    _LORA_MOE_SHAPE_DUMP_COUNTS[tag] = seen + 1
+    lines = [f"[LORA_MOE_SHAPES] tag={tag} call#{seen}"]
+    for name, value in tensors.items():
+        lines.append(f"  {name}: {get_tensor_info(value)}")
+    print("\n".join(lines), flush=True)

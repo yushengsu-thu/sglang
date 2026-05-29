@@ -147,6 +147,22 @@ def _invoke_moe_lora_expand_add(
     R = weight.shape[2]
     assert R <= 64, f"direct LoRA expand/add expects rank <= 64, got {R}"
 
+    from sglang.srt.debug_utils.dumper import maybe_dump_lora_moe_shapes
+
+    maybe_dump_lora_moe_shapes(
+        "expand_add",
+        intermediate=intermediate,
+        weight=weight,
+        output=output,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        mul_routed_weight=mul_routed_weight,
+        fuse_sum_all_reduce=fuse_sum_all_reduce,
+    )
+
     block_size_m = config["BLOCK_SIZE_M"]
     block_size_n = 128 if N % 128 == 0 else config["BLOCK_SIZE_N"]
     group_size_m = config.get("GROUP_SIZE_M", 1)
