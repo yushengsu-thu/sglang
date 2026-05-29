@@ -50,31 +50,31 @@ from sglang.srt.debug_utils.dumper import get_tensor_info
 # =============================================================================
 # Model presets
 # =============================================================================
-# NOTE: num_experts here is the PER-GPU expert count the LoRA sees (= total // ep),
-# NOT the model's total expert count. These are best-effort defaults; replace with the
-# faithful values captured on-machine via SGLANG_DEBUG_LORA_MOE_SHAPES.
+# Real per-rank dims captured live via SGLANG_DEBUG_LORA_MOE_SHAPES (results/SHAPES_FOR_CHUNAN.md).
+# KEY: the virtual-expert LoRA keeps the FULL routed-expert count per rank (it is NOT EP-sharded),
+# so `experts` below is the model's routed-expert count, not //ep. This ModelCfg models the
+# gate_up stage (the one overlapped on the side stream); for the exact two-stage shapes incl.
+# the down stage, use bench_real_shapes.py. n_out = gate_up per-rank moe-intermediate.
 @dataclass
 class ModelCfg:
     name: str
-    hidden: int  # hidden_size (K of shrink, N of down-expand)
-    intermediate: int  # per-TP intermediate (gate_up N is 2x this // tp; here already per-GPU)
-    num_experts_total: int
-    ep: int
+    hidden: int  # model hidden_size = shrink K
+    n_out: int  # gate_up expand N (per-rank moe-intermediate)
+    experts: int  # routed experts per rank (NOT EP-sharded)
     topk: int
     lora_rank: int
 
     @property
     def per_gpu_experts(self) -> int:
-        return max(1, self.num_experts_total // self.ep)
+        return self.experts
 
 
 MODELS = {
-    # Qwen/Qwen3.5-35B-A3B-FP8 : tp4 ep4, rank 16
-    "qwen35": ModelCfg("Qwen3.5-35B-A3B-FP8", 8192, 768, 256, 4, 8, 16),
-    # Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 : tp4 ep4, rank 16
-    "qwen3vl": ModelCfg("Qwen3-VL-30B-A3B-Instruct-FP8", 4096, 768, 128, 4, 8, 16),
-    # nvidia/Kimi-K2.5-NVFP4 : tp8 no-EP, rank 32
-    "kimi": ModelCfg("Kimi-K2.5-NVFP4", 7168, 2048, 384, 1, 8, 32),
+    # tp4 ep4, server-captured
+    "qwen35": ModelCfg("Qwen3.5-35B-A3B-FP8", 2048, 1024, 256, 8, 16),
+    "qwen3vl": ModelCfg("Qwen3-VL-30B-A3B-Instruct-FP8", 2048, 1536, 128, 8, 16),
+    # tp8 no-EP, DERIVED (see kimi_shapes_derived.md)
+    "kimi": ModelCfg("Kimi-K2.5-NVFP4", 7168, 256, 384, 8, 16),
 }
 
 
@@ -100,7 +100,7 @@ def make_inputs(cfg: ModelCfg, num_tokens: int, max_loras: int, dtype, device="c
     E = cfg.per_gpu_experts
     rank = cfg.lora_rank
     topk = cfg.topk
-    n_out = cfg.hidden
+    n_out = cfg.n_out
 
     hidden_states = torch.randn(num_tokens, cfg.hidden, dtype=dtype, device=device, generator=g)
     lora_a = torch.randn(max_loras, E, rank, cfg.hidden, dtype=dtype, device=device, generator=g) * 0.02

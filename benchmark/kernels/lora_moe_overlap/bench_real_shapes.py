@@ -26,11 +26,22 @@ from testbed import build_routing, stage_config
 DEV = "cuda"
 DT = torch.bfloat16
 
+# Real per-rank shapes captured live (see results/SHAPES_FOR_CHUNAN.md). kimi is derived.
 # (name, E, shrink_K, shrink_rankout, expand_N, expand_R, topk, mul_routed, sum_reduce)
-STAGES_QWEN35 = [
-    ("gate_up", 256, 2048, 32, 1024, 16, 8, False, False),
-    ("down",    256, 512, 16, 2048, 16, 1, True, True),
-]
+MODEL_STAGES = {
+    "qwen35": [  # tp4 ep4, E=256, H=2048, M=1024  [server-captured]
+        ("gate_up", 256, 2048, 32, 1024, 16, 8, False, False),
+        ("down",    256, 512, 16, 2048, 16, 1, True, True),
+    ],
+    "qwen3vl": [  # tp4 ep4, E=128, H=2048, M=1536  [server-captured]
+        ("gate_up", 128, 2048, 32, 1536, 16, 8, False, False),
+        ("down",    128, 768, 16, 2048, 16, 1, True, True),
+    ],
+    "kimi": [  # tp8 no-EP, E=384, H=7168, M=256  [DERIVED from config; verify on capture]
+        ("gate_up", 384, 7168, 32, 256, 16, 8, False, False),
+        ("down",    384, 256, 16, 7168, 16, 1, True, True),
+    ],
+}
 
 
 def make_topk(T, topk, E, g):
@@ -74,14 +85,16 @@ def bench_stage(name, E, K, rank_out, N, R, topk, mul_routed, sum_reduce, T):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--model", choices=list(MODEL_STAGES), default="qwen35")
     p.add_argument("--ts", default="16,32,64,2048")
     args = p.parse_args()
     Ts = [int(x) for x in args.ts.split(",")]
-    print("== Qwen3.5-35B-A3B-FP8 real-shape MoE-LoRA kernel latency (per TP rank, 256 experts) ==")
+    stages = MODEL_STAGES[args.model]
+    print(f"== {args.model} real-shape MoE-LoRA kernel latency (per TP rank) ==")
     for T in Ts:
         regime = "decode" if T <= 256 else "prefill"
         print(f"-- T={T} ({regime}) --")
-        for stage in STAGES_QWEN35:
+        for stage in stages:
             bench_stage(*stage, T=T)
 
 
