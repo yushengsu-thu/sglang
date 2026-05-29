@@ -633,6 +633,15 @@ def _merged_experts_fused_moe_lora_add_impl(
             if cached is not None:
                 return cached
 
+        # Single-LoRA (max_loras == 1) fast path: with one adapter the per-adapter
+        # virtual-expert offset (safe_lora * num_experts) is always 0, so
+        # virtual_topk_ids stays in [0, num_experts) ∪ {-1} and align never emits an
+        # expert id >= virtual_num_experts -> fused_sanitize_expert_ids is an identity
+        # and is skipped below. We KEEP _fused_virtual_topk_ids: it fuses the
+        # base-token masking + virtual_topk_ids build into a single launch, and
+        # measurements showed that replacing it with elementwise torch ops adds more
+        # launch overhead than skipping sanitize saves (~1.3% slower e2e).
+        single_lora = max_loras == 1
         virtual_topk_ids, token_lora_mask, virtual_num_experts = (
             _fused_virtual_topk_ids(
                 topk_ids, token_lora_mapping, num_experts, shared_outer, max_loras
@@ -653,7 +662,8 @@ def _merged_experts_fused_moe_lora_add_impl(
         )
         sorted_token_ids = sorted_token_ids[:tight_padded]
         expert_ids = expert_ids[: tight_padded // block_size]
-        expert_ids = fused_sanitize_expert_ids(expert_ids, virtual_num_experts)
+        if not single_lora:
+            expert_ids = fused_sanitize_expert_ids(expert_ids, virtual_num_experts)
         result = (
             sorted_token_ids,
             expert_ids,
