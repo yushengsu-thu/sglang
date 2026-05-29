@@ -117,8 +117,16 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     with torch.cuda.stream(side_stream):
         _run_gate_up_lora()
 
-    a_q, a_sf = per_token_group_quant_fp8(hidden_states, quant_info.weight_block_k)
-    a_sf_t = a_sf.t().contiguous()
+    # Fuse the scale transpose into the quant kernel. `column_major_scales=True` stores
+    # the per-token scales in a [K, M]-contiguous buffer presented as a logical [M, K]
+    # column-major view, so the free `.t()` below yields exactly the [K, M]-contiguous
+    # tensor the trtllm MoE kernel requires (it asserts scale.size(0) == hidden/128) —
+    # byte- and shape-identical to the old `a_sf.t().contiguous()`, but WITHOUT the
+    # separate ~2us transpose+copy launch.
+    a_q, a_sf = per_token_group_quant_fp8(
+        hidden_states, quant_info.weight_block_k, column_major_scales=True
+    )
+    a_sf_t = a_sf.t()
 
     activation_lora_input = torch.empty(
         (hidden_states.shape[0], runner_config.top_k, quant_info.intermediate_size),
