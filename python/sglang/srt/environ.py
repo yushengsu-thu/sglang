@@ -191,6 +191,25 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
+class LoRABOverlapMode(IntEnum):
+    """How the two-stream LoRA path schedules the LoRA-B (expand) gemm.
+
+    OFF:       LoRA-B runs on the main stream after the side-stream rejoin (it
+               fuses the add into base_output, so it must wait for the base gemm).
+    DECOUPLE:  LoRA-A shrink + LoRA-B expand both run on the side stream into a
+               fresh temp buffer (no dependence on base_output); the cheap add to
+               base_output happens on the main stream after both finish. Lets the
+               LoRA-B gemm overlap the base gemm without green contexts.
+    GREEN_CTX: Like DECOUPLE but the side stream is a green-context stream with a
+               reserved SM partition, and the base DeepGEMM is capped to the
+               complementary SM count (set_num_sms), forcing true co-execution.
+    """
+
+    OFF = 0
+    DECOUPLE = 1
+    GREEN_CTX = 2
+
+
 class Envs:
     # fmt: off
 
@@ -392,6 +411,12 @@ class Envs:
     # at most one adapter is active per batch (--max-loras-per-batch 1); the
     # TritonLoRABackend falls back to the Triton kernels otherwise.
     SGLANG_LORA_OPT_DENSE_GEMM = EnvBool(False)
+    # Two-stream LoRA: how to schedule the LoRA-B (expand) gemm relative to the
+    # base gemm. See LoRABOverlapMode. Only takes effect with SGLANG_LORA_TWO_STREAM=1.
+    SGLANG_LORA_B_OVERLAP = EnvInt(LoRABOverlapMode.OFF)
+    # GREEN_CTX mode: number of SMs reserved for the LoRA side-stream green context
+    # (the base gemm gets total_sms - this). None ⇒ auto (~12.5% of device SMs).
+    SGLANG_LORA_GREEN_CTX_SMS = EnvInt(None)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)

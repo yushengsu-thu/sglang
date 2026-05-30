@@ -22,13 +22,20 @@ to the saved-original implementation for non-decode batches (token count above
 path even with the patch installed.
 """
 import os
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import torch
+
+from sglang.srt.environ import LoRABOverlapMode, envs
 
 _ENV_KEY = "SGLANG_LORA_TWO_STREAM"
 _MAX_TOKENS_KEY = "SGLANG_TWO_STREAM_MAX_TOKENS"
 _MAX_TOKENS_DEFAULT = 256
+
+
+def get_lora_b_overlap_mode() -> LoRABOverlapMode:
+    """LoRA-B (expand) scheduling mode for the two-stream path."""
+    return LoRABOverlapMode(envs.SGLANG_LORA_B_OVERLAP.get())
 
 
 def is_two_stream_active(x: torch.Tensor) -> bool:
@@ -58,6 +65,52 @@ def get_lora_side_stream() -> torch.cuda.Stream:
     return _LORA_SIDE_STREAM
 
 
+# Green-context streams for GREEN_CTX mode: (lora_partition_stream, base_partition_stream).
+# Created once pre-capture; the two streams own disjoint SM partitions so the LoRA
+# side-stream work and the SM-capped base gemm run truly concurrently.
+_LORA_GREEN_STREAMS: Optional[tuple] = None
+# (lora_sms, base_sms) actually granted by the green-ctx split; base_sms feeds
+# DeepGEMM set_num_sms so the base gemm sizes its grid to its SM partition.
+_LORA_GREEN_SM_SPLIT: Optional[tuple] = None
+
+
+def get_lora_green_base_sms() -> Optional[int]:
+    return _LORA_GREEN_SM_SPLIT[1] if _LORA_GREEN_SM_SPLIT else None
+
+
+def get_lora_green_streams(
+    device: Optional[torch.device] = None,
+) -> Optional[tuple]:
+    """Lazily allocate (lora_stream, base_stream) on disjoint SM partitions.
+
+    Returns None if green contexts are unavailable (import/driver failure), so
+    callers can fall back to the shared side stream.
+    """
+    global _LORA_GREEN_STREAMS, _LORA_GREEN_SM_SPLIT
+    if _LORA_GREEN_STREAMS is not None:
+        return _LORA_GREEN_STREAMS
+    try:
+        import flashinfer.green_ctx as gctx
+
+        dev = device or torch.device("cuda", torch.cuda.current_device())
+        total = torch.cuda.get_device_properties(dev).multi_processor_count
+        lora_sms = envs.SGLANG_LORA_GREEN_CTX_SMS.get()
+        if lora_sms is None:
+            lora_sms = max(8, total // 8)
+        # streams[0] -> the requested lora partition; streams[-1] -> remaining SMs (base).
+        streams, _res = gctx.split_device_green_ctx_by_sm_count(dev, [lora_sms])
+        _LORA_GREEN_STREAMS = (streams[0], streams[-1])
+        _LORA_GREEN_SM_SPLIT = (lora_sms, max(1, total - lora_sms))
+    except Exception as e:  # pragma: no cover - depends on driver/flashinfer
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "LoRA green-context split unavailable (%s); falling back to side stream.", e
+        )
+        _LORA_GREEN_STREAMS = None
+    return _LORA_GREEN_STREAMS
+
+
 def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> None:
     """Eagerly create the side stream before cuda-graph capture begins.
 
@@ -73,8 +126,12 @@ def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> Non
     if device is not None:
         with torch.cuda.device(device):
             get_lora_side_stream()
+            if get_lora_b_overlap_mode() == LoRABOverlapMode.GREEN_CTX:
+                get_lora_green_streams(device)
     else:
         get_lora_side_stream()
+        if get_lora_b_overlap_mode() == LoRABOverlapMode.GREEN_CTX:
+            get_lora_green_streams()
 
 
 # References to the original implementations, captured at install time so the
@@ -159,6 +216,8 @@ def install_two_stream_overrides() -> None:
 __all__ = [
     "is_two_stream_active",
     "get_lora_side_stream",
+    "get_lora_green_streams",
+    "get_lora_b_overlap_mode",
     "init_lora_two_stream_resources",
     "get_original_qkv_forward",
     "get_original_row_forward",
