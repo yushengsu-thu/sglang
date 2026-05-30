@@ -387,6 +387,11 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # LoRA: replace the segmented Triton sgemm A/B kernels with a dense cuBLAS
+    # gemm (torch.matmul) for the attention/MLP LoRA projections. Only valid when
+    # at most one adapter is active per batch (--max-loras-per-batch 1); the
+    # TritonLoRABackend falls back to the Triton kernels otherwise.
+    SGLANG_LORA_OPT_DENSE_GEMM = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)

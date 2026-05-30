@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
     embedding_lora_a_fwd,
@@ -29,6 +30,60 @@ class TritonLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
+        # Dense-gemm fast path: with a single active adapter slot the segmented
+        # sgemm reduces to a plain matmul against weights[0]. Only safe when at
+        # most one adapter is active per batch (buffer first-dim == 1), which is
+        # guaranteed by --max-loras-per-batch 1. Static at capture time, so it is
+        # CUDA-graph safe.
+        self._use_dense_gemm = (
+            envs.SGLANG_LORA_OPT_DENSE_GEMM.get() and max_loras_per_batch == 1
+        )
+
+    # ------------------------------------------------------------------
+    # Dense (single-adapter) LoRA gemm helpers
+    # ------------------------------------------------------------------
+    # weights buffers are (num_lora=1, *, *); unused weight rows/cols beyond the
+    # adapter's actual rank are zero (zero-init buffers), so multiplying against
+    # the full buffer is numerically identical to the rank-trimmed Triton kernel.
+
+    def _dense_scaling(self) -> torch.Tensor:
+        # Per-adapter scaling for the single active slot (a 0-dim GPU tensor;
+        # reading it does not force a host sync, so it stays graph-safe).
+        return self.batch_info.scalings[0]
+
+    def _dense_lora_a(self, x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        # x: (s, K), weights: (1, stack*R, K) -> (s, stack*R). No scaling at A.
+        return torch.matmul(x, weights[0].transpose(0, 1))
+
+    def _dense_lora_b_add(
+        self,
+        a_out: torch.Tensor,
+        weights: torch.Tensor,
+        base_output: Optional[torch.Tensor],
+        n_offsets: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        # a_out: (s, n_slices*R), weights: (1, total_out, R).
+        # delta[:, off_i:off_{i+1}] = scaling * (a_out[:, i*R:(i+1)*R] @ W[off_i:off_{i+1}].T)
+        scaling = self._dense_scaling()
+        w = weights[0]
+        total_out = w.shape[0]
+        R = w.shape[1]
+        if base_output is None:
+            out = a_out.new_zeros((a_out.shape[0], total_out))
+        else:
+            out = base_output
+        if n_offsets is None or len(n_offsets) <= 2:
+            # Single slice (o_proj, lm_head, embedding, column/row parallel).
+            delta = torch.matmul(a_out, w.transpose(0, 1))
+            out.add_(delta * scaling)
+        else:
+            # Fused q/k/v (or gate/up) slices packed in a_out with stride R.
+            for i in range(len(n_offsets) - 1):
+                n0, n1 = n_offsets[i], n_offsets[i + 1]
+                a_slice = a_out[:, i * R : (i + 1) * R]
+                delta = torch.matmul(a_slice, w[n0:n1].transpose(0, 1))
+                out[:, n0:n1].add_(delta * scaling)
+        return out
 
     def run_lora_a_embedding(
         self,
@@ -63,6 +118,8 @@ class TritonLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        if self._use_dense_gemm:
+            return self._dense_lora_a(x, weights)
         return sgemm_lora_a_fwd(
             x, weights, self._sgemm_info(pruned_batch_info), stack_num=stack_num
         )
@@ -76,6 +133,8 @@ class TritonLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        if self._use_dense_gemm:
+            return self._dense_lora_b_add(x, weights, base_output)
         return sgemm_lora_b_fwd(
             x, weights, self._sgemm_info(pruned_batch_info), base_output
         )
@@ -89,6 +148,7 @@ class TritonLoRABackend(BaseLoRABackend):
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
         n_slices: int = 3,
+        output_offset_cpu: torch.Tensor = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -97,6 +157,12 @@ class TritonLoRABackend(BaseLoRABackend):
         # qkv_lora_a: (num_lora, n_slices * r, input_dim)
         # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
+
+        if self._use_dense_gemm:
+            a_out = self._dense_lora_a(x, qkv_lora_a)
+            return self._dense_lora_b_add(
+                a_out, qkv_lora_b, base_output, n_offsets=output_offset_cpu.tolist()
+            )
 
         sgemm_info = self._sgemm_info()
         lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=n_slices)
@@ -117,6 +183,7 @@ class TritonLoRABackend(BaseLoRABackend):
         gate_up_lora_a: torch.Tensor,
         gate_up_lora_b: torch.Tensor,
         base_output: torch.Tensor = None,
+        output_offset_cpu: torch.Tensor = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -126,6 +193,17 @@ class TritonLoRABackend(BaseLoRABackend):
         # gate_up_lora_b: (num_lora, 2 * output_dim, r)
         assert isinstance(gate_up_lora_b, torch.Tensor)
         output_dim = gate_up_lora_b.shape[-2] // 2
+
+        if self._use_dense_gemm:
+            a_out = self._dense_lora_a(x, gate_up_lora_a)
+            n_offsets = (
+                output_offset_cpu.tolist()
+                if output_offset_cpu is not None
+                else [0, output_dim, 2 * output_dim]
+            )
+            return self._dense_lora_b_add(
+                a_out, gate_up_lora_b, base_output, n_offsets=n_offsets
+            )
 
         sgemm_info = self._sgemm_info()
         # lora_a_output: (s, 2 * r)
@@ -300,9 +378,10 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info
 
-        # Biggest win is in decode.
+        # Biggest win is in decode. The dense fast path does not use the merged
+        # per-adapter segments, so skip the routing sort entirely when enabled.
         is_decode = not forward_batch.forward_mode.is_extend()
-        if is_decode:
+        if is_decode and not self._use_dense_gemm:
             self.compute_sgemm_routing(use_cuda_graph)
         else:
             self.sgemm_batch_info = None
