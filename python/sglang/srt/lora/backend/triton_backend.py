@@ -63,26 +63,31 @@ class TritonLoRABackend(BaseLoRABackend):
         n_offsets: Optional[List[int]] = None,
     ) -> torch.Tensor:
         # a_out: (s, n_slices*R), weights: (1, total_out, R).
-        # delta[:, off_i:off_{i+1}] = scaling * (a_out[:, i*R:(i+1)*R] @ W[off_i:off_{i+1}].T)
-        scaling = self._dense_scaling()
+        # out[:, off_i:off_{i+1}] += scaling * (a_out[:, i*R:(i+1)*R] @ W[off_i:off_{i+1}].T)
+        #
+        # Fold the per-adapter scaling into a_out once (a graph-safe tensor mul -
+        # addmm_'s alpha must be a Python scalar, and reading the scaling tensor
+        # via .item() would force a host sync that breaks cuda-graph capture).
+        # Each output slice is then a single fused addmm_ (matmul + in-place add,
+        # no temp) instead of matmul + mul + add_.
         w = weights[0]
         total_out = w.shape[0]
         R = w.shape[1]
+        a_out = a_out * self._dense_scaling()
         if base_output is None:
             out = a_out.new_zeros((a_out.shape[0], total_out))
         else:
             out = base_output
         if n_offsets is None or len(n_offsets) <= 2:
             # Single slice (o_proj, lm_head, embedding, column/row parallel).
-            delta = torch.matmul(a_out, w.transpose(0, 1))
-            out.add_(delta * scaling)
+            out.addmm_(a_out, w.transpose(0, 1))
         else:
             # Fused q/k/v (or gate/up) slices packed in a_out with stride R.
+            # Block-diagonal by construction (each slice uses its own R-block and
+            # its own output rows), so it is inherently one matmul per slice.
             for i in range(len(n_offsets) - 1):
                 n0, n1 = n_offsets[i], n_offsets[i + 1]
-                a_slice = a_out[:, i * R : (i + 1) * R]
-                delta = torch.matmul(a_slice, w[n0:n1].transpose(0, 1))
-                out[:, n0:n1].add_(delta * scaling)
+                out[:, n0:n1].addmm_(a_out[:, i * R : (i + 1) * R], w[n0:n1].transpose(0, 1))
         return out
 
     def run_lora_a_embedding(
