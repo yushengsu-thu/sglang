@@ -94,13 +94,23 @@ def get_lora_green_streams(
 
         dev = device or torch.device("cuda", torch.cuda.current_device())
         total = torch.cuda.get_device_properties(dev).multi_processor_count
+        # SM partitions must be a multiple of the green-ctx alignment (typically 8)
+        # so the granted lora partition equals what we request and the remaining
+        # base partition is known exactly.
+        major, minor = gctx.get_compute_capability(dev)
+        _min_sms, align = gctx.get_sm_count_constraint(major, minor)
+        align = max(1, align)
         lora_sms = envs.SGLANG_LORA_GREEN_CTX_SMS.get()
         if lora_sms is None:
-            lora_sms = max(8, total // 8)
+            lora_sms = total // 8
+        lora_sms = max(align, (lora_sms // align) * align)
+        # base gets the rest; DeepGEMM's set_num_sms requires an EVEN count.
+        base_sms = max(2, total - lora_sms)
+        base_sms -= base_sms % 2
         # streams[0] -> the requested lora partition; streams[-1] -> remaining SMs (base).
         streams, _res = gctx.split_device_green_ctx_by_sm_count(dev, [lora_sms])
         _LORA_GREEN_STREAMS = (streams[0], streams[-1])
-        _LORA_GREEN_SM_SPLIT = (lora_sms, max(1, total - lora_sms))
+        _LORA_GREEN_SM_SPLIT = (lora_sms, base_sms)
     except Exception as e:  # pragma: no cover - depends on driver/flashinfer
         import logging
 
