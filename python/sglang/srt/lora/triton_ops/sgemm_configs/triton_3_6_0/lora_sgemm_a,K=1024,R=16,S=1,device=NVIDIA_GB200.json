@@ -68,14 +68,18 @@
         "num_stages": 2
     },
     "32": {
-        "BLOCK_S": 16,
+        "BLOCK_S": 32,
         "BLOCK_N": 16,
-        "BLOCK_K": 256
+        "BLOCK_K": 64,
+        "num_warps": 4,
+        "num_stages": 4
     },
     "48": {
-        "BLOCK_S": 16,
+        "BLOCK_S": 32,
         "BLOCK_N": 16,
-        "BLOCK_K": 256
+        "BLOCK_K": 128,
+        "num_warps": 4,
+        "num_stages": 3
     },
     "64": {
         "BLOCK_S": 16,
