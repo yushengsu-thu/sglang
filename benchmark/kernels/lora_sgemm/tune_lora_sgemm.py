@@ -153,6 +153,22 @@ def sort_cfg(c):
     return {k: c[k] for k in ["BLOCK_S", "BLOCK_N", "BLOCK_K", "num_warps", "num_stages"] if k in c}
 
 
+# Historical hardcoded block sizes (the launcher's fallback). Emitted verbatim
+# for a bucket when tuning doesn't clearly beat them — block-only (no num_warps/
+# num_stages) so the launch is byte-identical to the untuned default => that
+# bucket's e2e == base, guaranteeing no regression.
+def default_cfg(kernel, S):
+    if kernel == "sgemm_a":
+        return {"BLOCK_S": 16, "BLOCK_N": 16, "BLOCK_K": 256}
+    if S == 1:  # sgemm_lora_b
+        return {"BLOCK_S": 16, "BLOCK_N": 256, "BLOCK_K": 16}
+    return {"BLOCK_S": 16, "BLOCK_N": 64, "BLOCK_K": 16}  # gate_up (S=2) / qkv (S>=3)
+
+
+# Minimum microbench speedup over default required to adopt a tuned config.
+GUARD_MARGIN = 0.03
+
+
 def save_config(configs, kernel, K, R, S) -> str:
     fn = get_sgemm_config_file_name(kernel, K, R, S)
     vdir = f"triton_{triton.__version__.replace('.', '_')}"
@@ -172,19 +188,29 @@ def tune_shape(kernel, K, R, S, max_lens, dev, dt):
     else:
         search = expand_space(R); rank_for_bi = R          # reduction dim = adapter rank R
     print(f"search={len(search)} configs")
+    dflt = default_cfg(kernel, S)
+    measure = (lambda c, bi: bench_shrink(c, K, R, S, bi, dev, dt)) if kernel == "sgemm_a" \
+        else (lambda c, bi: bench_expand(c, K, R, S, bi, dev, dt))
     best = {}
     for ml in max_lens:
         bi = build_batch_info(ml, rank_for_bi, dev)
+        dt_def = measure(dflt, bi)                     # default's time for this bucket
         bc, bt = None, float("inf")
         for c in search:
-            t = (bench_shrink(c, K, R, S, bi, dev, dt) if kernel == "sgemm_a"
-                 else bench_expand(c, K, R, S, bi, dev, dt))
+            t = measure(c, bi)
             if t is not None and t < bt:
                 bt, bc = t, c
         if bc is None:
             print(f"  max_len={ml}: NO valid config"); continue
-        best[ml] = sort_cfg(bc)
-        print(f"  max_len={ml}: {bt:.4f}ms {best[ml]}")
+        # no-regression guard: adopt tuned only if it beats default by >= margin;
+        # else emit the default verbatim so this bucket stays == base.
+        if dt_def is not None and bt >= dt_def * (1.0 - GUARD_MARGIN):
+            best[ml] = dict(dflt)
+            print(f"  max_len={ml}: keep DEFAULT (tuned {bt:.4f} vs default {dt_def:.4f}ms)")
+        else:
+            best[ml] = sort_cfg(bc)
+            spd = (dt_def / bt) if (dt_def and bt) else float('nan')
+            print(f"  max_len={ml}: TUNED {bt:.4f}ms ({spd:.2f}x vs default {dt_def:.4f}) {best[ml]}")
     return best
 
 
