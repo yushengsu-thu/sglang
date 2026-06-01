@@ -64,9 +64,7 @@
     "32": {
         "BLOCK_S": 16,
         "BLOCK_N": 64,
-        "BLOCK_K": 32,
-        "num_warps": 4,
-        "num_stages": 3
+        "BLOCK_K": 16
     },
     "48": {
         "BLOCK_S": 16,
