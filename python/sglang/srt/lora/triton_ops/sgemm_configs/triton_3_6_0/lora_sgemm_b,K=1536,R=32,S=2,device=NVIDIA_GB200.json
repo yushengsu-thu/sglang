@@ -1,0 +1,128 @@
+{
+    "1": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 256,
+        "BLOCK_K": 16,
+        "num_warps": 4,
+        "num_stages": 3
+    },
+    "2": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 128,
+        "BLOCK_K": 16,
+        "num_warps": 8,
+        "num_stages": 2
+    },
+    "3": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 16,
+        "num_warps": 8,
+        "num_stages": 3
+    },
+    "4": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "5": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 256,
+        "BLOCK_K": 16,
+        "num_warps": 8,
+        "num_stages": 3
+    },
+    "6": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 256,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "7": {
+        "BLOCK_S": 16,
+        "BLOCK_N": 256,
+        "BLOCK_K": 32,
+        "num_warps": 8,
+        "num_stages": 2
+    },
+    "8": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 256,
+        "BLOCK_K": 32,
+        "num_warps": 8,
+        "num_stages": 4
+    },
+    "16": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 128,
+        "BLOCK_K": 32,
+        "num_warps": 8,
+        "num_stages": 4
+    },
+    "24": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 256,
+        "BLOCK_K": 16,
+        "num_warps": 8,
+        "num_stages": 3
+    },
+    "32": {
+        "BLOCK_S": 16,
+        "BLOCK_N": 256,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "48": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 256,
+        "BLOCK_K": 16,
+        "num_warps": 4,
+        "num_stages": 4
+    },
+    "64": {
+        "BLOCK_S": 16,
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "num_warps": 8,
+        "num_stages": 3
+    },
+    "512": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 128,
+        "BLOCK_K": 16,
+        "num_warps": 4,
+        "num_stages": 4
+    },
+    "1024": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 16,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "2048": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 16,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "4096": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 3
+    },
+    "8192": {
+        "BLOCK_S": 32,
+        "BLOCK_N": 128,
+        "BLOCK_K": 16,
+        "num_warps": 4,
+        "num_stages": 2
+    }
+}
