@@ -149,6 +149,72 @@ def bench_expand(cfg, Kout, R, S, bi, dev, dt):
         set_sgemm_config_override(None)
 
 
+# ---- verify (correctness gate): tuned-config output vs default + torch ref ----
+
+def _shrink_out(cfg, K, N, S, bi, dev, dt, x, w):
+    set_sgemm_config_override(cfg)
+    try:
+        return sgemm_lora_a_fwd(x, w, bi, stack_num=S)
+    finally:
+        set_sgemm_config_override(None)
+
+
+def _expand_out(cfg, Kout, R, S, bi, dev, dt, x, w):
+    set_sgemm_config_override(cfg)
+    try:
+        if S == 1:
+            o = torch.zeros(bi.max_len, Kout, device=dev, dtype=dt)
+            return sgemm_lora_b_fwd(x, w, bi, o)
+        if S == 2:
+            o = torch.zeros(bi.max_len, 2 * Kout, device=dev, dtype=dt)
+            return gate_up_lora_b_fwd(x, w, bi, Kout, o)
+        o = torch.zeros(bi.max_len, S * Kout, device=dev, dtype=dt)
+        off = torch.tensor([i * Kout for i in range(S + 1)], dtype=torch.int32, device=dev)
+        return qkv_lora_b_fwd(x, w, bi, off, Kout, o, n_slices=S)
+    finally:
+        set_sgemm_config_override(None)
+
+
+def _torch_ref(kernel, Kout, R, S, x, w):
+    """Reference output (fp32 matmul) for the synthetic single-adapter layout.
+    Adapter weights live in slot 1 (w[1]); rank=R unclipped."""
+    A = w[1].float()  # (N,K) shrink  or (slice*Kout, R) expand
+    xf = x.float()
+    if kernel == "sgemm_a":
+        return (xf @ A.t())               # (M, N=R)
+    if S == 1:
+        return (xf @ A.t())               # (M, Kout)
+    # multi-slice expand: slice i uses x[:, i*R:(i+1)*R] @ w[1, i*Kout:(i+1)*Kout].T
+    outs = [xf[:, i * R:(i + 1) * R] @ A[i * Kout:(i + 1) * Kout].t() for i in range(S)]
+    return torch.cat(outs, dim=1)         # (M, S*Kout)
+
+
+def verify_shape(kernel, K, R, S, dev, dt, ml=32):
+    """Run default + an alt (different BLOCK_K/S to stress reduction order) +
+    torch ref; report max-abs-err. PASS if both within bf16 tol."""
+    torch.manual_seed(0)
+    bi = build_batch_info(ml, R, dev)
+    if kernel == "sgemm_a":
+        x = torch.randn(ml, K, device=dev, dtype=dt); w = torch.randn(2, R, K, device=dev, dtype=dt)
+        run = lambda c: _shrink_out(c, K, R, S, bi, dev, dt, x, w)
+        dflt = {"BLOCK_S": 16, "BLOCK_N": 16, "BLOCK_K": 256}
+        alt = {"BLOCK_S": 32, "BLOCK_N": 16, "BLOCK_K": 64, "num_warps": 8, "num_stages": 3}
+    else:
+        nx = (R if S == 1 else S * R); nw = (K if S == 1 else S * K)
+        x = torch.randn(ml, nx, device=dev, dtype=dt); w = torch.randn(2, nw, R, device=dev, dtype=dt)
+        run = lambda c: _expand_out(c, K, R, S, bi, dev, dt, x, w)
+        dflt = {"BLOCK_S": 16, "BLOCK_N": (256 if S == 1 else 64), "BLOCK_K": 16}
+        alt = {"BLOCK_S": 32, "BLOCK_N": 128, "BLOCK_K": min(64, max(16, R)), "num_warps": 8, "num_stages": 3}
+    out_d = run(dflt).float(); out_a = run(alt).float(); ref = _torch_ref(kernel, K, R, S, x, w)
+    e_da = (out_a - out_d).abs().max().item()
+    scale = ref.abs().max().item() + 1e-6
+    e_dr = (out_d - ref).abs().max().item() / scale
+    e_ar = (out_a - ref).abs().max().item() / scale
+    ok = (e_dr < 2e-2) and (e_ar < 2e-2) and (e_da / scale < 2e-2)
+    print(f"  {kernel} K={K} R={R} S={S}: |alt-def|={e_da:.2e} relerr def={e_dr:.2e} alt={e_ar:.2e}  {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def sort_cfg(c):
     return {k: c[k] for k in ["BLOCK_S", "BLOCK_N", "BLOCK_K", "num_warps", "num_stages"] if k in c}
 
@@ -224,6 +290,11 @@ def main(args):
         if not tok: continue
         kernel, K, R, S = tok.split(":")
         shapes.append((kernel, int(K), int(R), int(S)))
+    if args.verify:
+        print(f"VERIFY {len(shapes)} shapes (tuned/alt vs default vs torch ref, bf16 tol)")
+        allok = all(verify_shape(kernel, K, R, S, dev, dt) for kernel, K, R, S in shapes)
+        print("\nVERIFY", "PASS" if allok else "FAIL")
+        import sys; sys.exit(0 if allok else 1)
     print(f"Tuning {len(shapes)} shapes over max_lens={max_lens} dtype={args.dtype}")
     for kernel, K, R, S in shapes:
         best = tune_shape(kernel, K, R, S, max_lens, dev, dt)
@@ -242,4 +313,6 @@ if __name__ == "__main__":
                    default=[512, 1024, 2048, 4096, 8192])
     p.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--verify", action="store_true",
+                   help="correctness gate only: tuned/alt vs default vs torch ref (no tuning)")
     main(p.parse_args())
