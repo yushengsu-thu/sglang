@@ -3,7 +3,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.lora_tuning_config import get_sgemm_a_config
 from sglang.srt.lora.utils import LoRABatchInfo
+
+# Historical hardcoded block sizes; used as the fallback when no tuned config
+# exists. BLOCK_N here tiles N = stack_num * rank (the small output dim).
+DEFAULT_SGEMM_A_CONFIG = {"BLOCK_S": 16, "BLOCK_N": 16, "BLOCK_K": 256}
 
 
 @triton.jit
@@ -142,13 +147,27 @@ def sgemm_lora_a_fwd(
     K = weights.shape[-1]
     assert x.shape[-1] == K
 
-    # Block shapes
-    BLOCK_S = 16
-    BLOCK_K = 256
-    BLOCK_R = 16
+    # Block shapes: tuned via generated configs (sgemm_configs/), keyed by
+    # max_len; falls back to the historical hardcoded values. BLOCK_N tiles
+    # N = stack_num * rank.
+    cfg = get_sgemm_a_config(
+        K=K,
+        R=R,
+        num_slices=stack_num,
+        max_len=batch_info.max_len,
+        default=DEFAULT_SGEMM_A_CONFIG,
+    )
+    BLOCK_S = cfg["BLOCK_S"]
+    BLOCK_N = cfg["BLOCK_N"]
+    BLOCK_K = cfg["BLOCK_K"]
+    launch_kwargs = {}
+    if "num_warps" in cfg:
+        launch_kwargs["num_warps"] = cfg["num_warps"]
+    if "num_stages" in cfg:
+        launch_kwargs["num_stages"] = cfg["num_stages"]
 
     grid = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(R, BLOCK_R),
+        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(R, BLOCK_N),
         batch_info.bs,
     )
 
@@ -176,7 +195,8 @@ def sgemm_lora_a_fwd(
         batch_info.permutation,
         sorted_by_adapter,
         BLOCK_S,
-        BLOCK_R,
+        BLOCK_N,
         BLOCK_K,
+        **launch_kwargs,
     )
     return output

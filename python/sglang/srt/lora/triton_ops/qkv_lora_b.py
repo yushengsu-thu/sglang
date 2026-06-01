@@ -3,7 +3,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.lora_tuning_config import get_sgemm_b_config
 from sglang.srt.lora.utils import LoRABatchInfo
+
+# Historical hardcoded block sizes; fallback when no tuned config exists.
+# BLOCK_N tiles max_qkv_out_dim (per-slice output width); BLOCK_K tiles rank.
+DEFAULT_QKV_B_CONFIG = {"BLOCK_S": 16, "BLOCK_N": 64, "BLOCK_K": 16}
 
 
 @triton.jit
@@ -170,9 +175,24 @@ def qkv_lora_b_fwd(
     assert input_dim == n_slices * r
     assert output_offset.shape[0] == n_slices + 1
 
-    BLOCK_S = 16
-    BLOCK_R = 16
-    BLOCK_OUT = 64
+    # Block shapes: tuned via generated configs (sgemm_configs/), keyed by
+    # max_len; falls back to the historical hardcoded values. BLOCK_N tiles
+    # max_qkv_out_dim (per-slice output width); BLOCK_K tiles K = rank.
+    cfg = get_sgemm_b_config(
+        K=max_qkv_out_dim,
+        R=r,
+        num_slices=n_slices,
+        max_len=batch_info.max_len,
+        default=DEFAULT_QKV_B_CONFIG,
+    )
+    BLOCK_S = cfg["BLOCK_S"]
+    BLOCK_OUT = cfg["BLOCK_N"]
+    BLOCK_K = cfg["BLOCK_K"]
+    launch_kwargs = {}
+    if "num_warps" in cfg:
+        launch_kwargs["num_warps"] = cfg["num_warps"]
+    if "num_stages" in cfg:
+        launch_kwargs["num_stages"] = cfg["num_stages"]
 
     grid_b = (
         triton.cdiv(batch_info.max_len, BLOCK_S)
@@ -209,8 +229,9 @@ def qkv_lora_b_fwd(
         sorted_by_adapter,
         BLOCK_S,
         BLOCK_OUT,
-        BLOCK_R,
+        BLOCK_K,
         batch_info.scalings,
+        **launch_kwargs,
     )
 
     return output
