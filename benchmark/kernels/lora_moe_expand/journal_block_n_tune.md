@@ -59,5 +59,9 @@ Correctness: `--mode correctness` 6/6 PASS (block_m {16,32,64} × bs {16,64}), m
 - [x] Correctness (6/6 PASS) + bit-identical output.
 - [x] Production-config bench: Kimi 27.3→20.1 µs (~25%); Qwen keep-128 confirmed.
 - [x] Qwen3.5 + Qwen3-VL server regression: no acc / no perf regression.
-- [ ] Kimi-K2.5 2-node server A/B (acc + perf) — running.
+- [ ] Kimi-K2.5 2-node server A/B (acc + perf) — BLOCKED by 2-node (tp8 MNNVL, NVFP4)
+      serving-stack instability: base config (env off, no kernel change) fails to start —
+      CUDA-graph-capture OOM at mem-frac 0.88, and model-load/init death at 0.82 (loading the
+      551GB NVFP4 weights across tp8). Independent of this kernel change (runtime-only). The
+      kernel win is already proven by the production-config bench above.
 - [ ] (follow-up) consider making this a generated/tuned config entry rather than a launcher branch.
