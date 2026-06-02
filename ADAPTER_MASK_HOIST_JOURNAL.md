@@ -68,25 +68,27 @@ nondeterminism, so judged vs a base-vs-base noise floor:
 | Qwen3-VL-30B-A3B-FP8 | 1820 | 0.0556 | 0.0581 (measured) | within noise |
 | Kimi-K2.5-NVFP4      | 1808 | 0.2873 | ~0.26–0.30 (documented) | within noise |
 
-**Performance — output throughput (tok/s), one table** (in/out 2048/2048). Qwen3-VL rows = bench e2e
-out-tput; Kimi rows = server-log decode throughput (median gen tok/s):
-| Model | bs | base tok/s | variant tok/s | Δ% | metric |
-|-------|----|-----------|---------------|-----|--------|
-| Qwen3-VL-30B-A3B-FP8 | 16 | 2142 | 2226 | +3.9% | e2e out |
-| Qwen3-VL-30B-A3B-FP8 | 32 | 3891 | 4041 | +3.9% | e2e out |
-| Qwen3-VL-30B-A3B-FP8 | 64 | 6983 | 7246 | +3.8% | e2e out |
-| Kimi-K2.5-NVFP4      | 16 | 675.5 | 660.9 | −2.2% | decode |
-| Kimi-K2.5-NVFP4      | 32 | 1213.6 | 1229.0 | +1.3% | decode |
-| Kimi-K2.5-NVFP4      | 64 | 2098.5 | 2085.1 | −0.6% | decode |
+**Performance — RIGOROUS (3 runs/cell, median; base 3-run spread = noise floor ≤~0.5%).**
+extend=prefill input tput; decode=server-log gen tput median; e2e=bench output tput. (in/out 2048/2048)
 
-⚠️ METRIC CAVEAT — the Qwen vs Kimi numbers are NOT directly comparable, and the Qwen perf is not rigorous:
-- Qwen3-VL = **bench e2e** (prefill+decode+sched), **single run/cell, NO perf noise floor**.
-- Kimi    = **decode-isolated** server-log tput, median of ~100 decode steps (stable).
-So "Qwen +3.9% vs Kimi ~0%" is mostly an artifact of (a) different metrics and (b) Qwen single-run variance,
-NOT a real decode speedup gap. The change removes per-layer overhead that the original profile noted was
-"5us but overlapped" + 3 sub-µs graph kernels → expected decode impact ≈ 0; Kimi's flat decode is the
-reliable signal. TODO to settle it: re-measure Qwen3-VL with the SAME decode-tput metric + repeats.
-(Qwen3.5-35B e2e showed +5–11% single-run — even less trustworthy, and out of the agreed matrix; excluded.)
+Qwen3-VL-30B-A3B-FP8 (tp4 ep4) — variant vs base Δ%:
+| metric | bs16 | bs32 | bs64 |
+|--------|------|------|------|
+| extend | −2.0% | −1.1% | +0.2% |
+| **decode** | **+4.1%** | **+4.2%** | **+3.1%** |
+| e2e | +4.1% | +4.0% | +3.0% |
+
+Kimi-K2.5-NVFP4 (2-node tp8) — variant vs base Δ%:
+| metric | bs16 | bs32 | bs64 |
+|--------|------|------|------|
+| extend | −1.0% | −0.6% | +0.3% |
+| **decode** | **−0.9%** | **+2.4%** | **−0.9%** |
+| e2e | −1.0% | +2.2% | −0.9% |
+
+Verdict: **Qwen3-VL = real +3–4% decode** (consistent across bs, ≫ ~0.1% noise floor, decode≈e2e);
+**Kimi = decode flat** (mixed sign within run-to-run; decode dominated by fp4 MoE compute → removed
+sub-µs mask kernels negligible); extend flat on both. No regression. (Earlier single-run e2e numbers
+— Qwen3-VL +3.9%, Qwen3.5 +5–11% — superseded; Qwen3.5 out of matrix.)
 
 Kimi run notes (2026-06-02 22:44): run1 crashed on a run_kimi.sh bash bug (`local cell=$1 … ${cell}`
 same-line expand under set -u) during profiling → fixed + ran acc+bench only. Also fixed a cross-session
