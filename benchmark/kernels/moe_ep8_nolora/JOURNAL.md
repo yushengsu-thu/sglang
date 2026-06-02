@@ -290,4 +290,22 @@ when it comes up, before drawing any comparison.
 - **Does NOT apply to the current pods** — k8s volumes are immutable post-creation; re-applying would
   recreate the pods (killing the running EP8 cell + losing the model download). Future runs only.
 - Note: EP8 still re-autotunes vs TP8 even with the mount — different grouped-GEMM shapes
-  (48 vs 384 experts/rank) = separate cache entries. Observed EP8 cold step-1 ≈ 338s (matches base).
+  (48 vs 384 experts/rank) = separate cache entries. Observed EP8 cold step-1 ~338s (matches base).
+
+### 2026-06-03 00:21 (KST) — EP8 first launch CRASHED (cross-rank autotune desync) + option-1 fix
+- EP8 launched & loaded fine (resolved `ep_size=8, flashinfer_trtllm, a2a=none`), but **died during the
+  cold `fp4_gemm` autotune**. Caught it via the new STUCK-CHECK rule: two checks showed CPU ~96% idle,
+  GPU util 0%, head `/tmp/server.log` byte-count unchanged over 30s, sglang procs decreasing 4->1 on
+  both pods, then **all GPU memory freed** (72GB weights + 78GB KV gone -> processes exited). No Python
+  traceback, no Watchdog/OOM/signal line; host RAM had 1583 GB free (not host-OOM).
+- **Root cause = cross-rank autotune desync.** head log stuck at `Tuning fp4_gemm 1/20` (its step-1 cold
+  JIT ~340s) while the **worker raced to 8/20** — under EP8 each rank cold-JIT-autotunes its OWN
+  48-expert grouped-GEMM shapes, which compile at different speeds, so ranks drift; the EP cross-rank op
+  (combine / graph-capture barrier) then can't line up -> abort -> full teardown. **TP8 is immune**:
+  no-EP means every rank tunes the SAME replicated GEMM in lockstep.
+- **Fix (user picked option 1 = warm the autotune cache):** the cache only warms if the autotune
+  COMPLETES once, so raised `--dist-timeout 7200 --watchdog-timeout 7200` to let the slow (head) rank
+  finish all 20 steps without the fast rank's abort/watchdog killing the group. That writes the EP8
+  cache (`/root/.cache/.../rank_tp*.json`); later EP8 launches load it -> no JIT skew -> synchronized.
+  The hostPath `/root/.cache` mount persists it for future pods.
+- Re-running EP8 (`CELLS=variant`, bg `bj5eiz3y0`); monitoring with the STUCK-CHECK rule.
