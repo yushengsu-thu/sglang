@@ -199,3 +199,18 @@ graph and times replay (matches serving). S=64 (real bs=64 per TP rank):
   vs variant (flag on = fused). Captures per-cell (a) bench e2e, (b) **server-log decode thpt**, (c) graph-on
   traces (to confirm `_step_*` replaced by `_fused_q/v_kernel`). Skips graph-off to save time.
 - Expected: acc within noise; trace `_step_*`→0 in variant + `_fused_*` present; decode thpt slightly up.
+
+## 9. (2026-06-03 01:10) E2E #1 INVALID (silent checkout failure) → re-running at wired commit
+
+- First E2E ran but BOTH cells silently checked out 191c862ee (pre-wiring), NOT c4337dcf47. Variant
+  trace showed NEITHER _step_* NOR _fused_* → it ran the OLD torch-bmm dense path. INVALID.
+- ROOT CAUSE: earlier I `kubectl cp`'d kv_b_lora_single_fused.py directly into the pod tree (for the
+  micro-bench) as an UNTRACKED file while HEAD=191c862ee. run_cell's `git checkout -q --detach c4337`
+  (which tracks that file) refused ("untracked file would be overwritten"); `-q` swallowed the error →
+  HEAD stayed at 191c862ee → ran old code. __bench_base/variant refs were correct (c4337); only the
+  working tree was stale.
+- FIX: rm the stray untracked file + `git checkout -f` on both pods (now HEAD=c4337dcf4, imports fused=2);
+  hardened run_cell checkout to `git checkout -f`. base cell is unaffected (flag-off = Triton _step_*,
+  same regardless of commit) and was fully captured (acc/bench/serverlog/traces), so re-running VARIANT only.
+- LESSON: never leave untracked files in the bundle-checkout tree; always `checkout -f` + check the
+  printed commit hash matches the intended one (verify testbed commit, like verifying testbed speed/shape).
