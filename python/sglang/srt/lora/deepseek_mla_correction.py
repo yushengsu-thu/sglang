@@ -45,18 +45,25 @@ if TYPE_CHECKING:
 def _dense_path_active(batch_info: "LoRABatchInfo") -> bool:
     """Whether the experimental dense kv_b LoRA correction applies.
 
-    Restricted to the single-active-adapter case so we can gather one slot's
-    weights graph-safely (length-1 ``index_select``, no ``.item()`` sync) and
-    skip per-segment routing. ``num_segments`` is a host-side int; for the
-    Triton backend single-adapter decode repeats merge into one segment. A row
-    permutation means adapter-grouped chunking (multi-adapter) -> fall back to
-    the Triton kernels. Assumes buffer rank == active adapter rank (the common
-    single-adapter deployment); mixed/zero-padded ranks would need a per-slot
-    truncation that costs a GPU sync, so those keep the kernel path.
+    Restricted to the single-active-adapter case (``num_segments == 1`` <=>
+    ``max_loras_per_batch == 1``) so we can gather the one slot's weights
+    graph-safely (length-1 ``index_select``, no ``.item()`` sync) and skip
+    per-segment routing. ``num_segments`` is a host-side int.
+
+    NOTE: we deliberately do NOT reject a non-None ``permutation``. The Triton
+    backend's sgemm routing (``compute_sgemm_routing``) ALWAYS builds a
+    permutation = ``argsort(weight_indices)``; for a single adapter the indices
+    are all-equal so it is the identity, and every token uses the same slot ->
+    the dense per-row math (read row r, apply the slot weight, write row r) is
+    independent of the permutation. Rejecting it (as an earlier version did)
+    meant dense never engaged in real single-adapter decode. Multi-adapter
+    (``num_segments > 1``) still falls back to the Triton kernels.
+
+    Assumes buffer rank == active adapter rank (the common single-adapter
+    deployment); mixed/zero-padded ranks would need a per-slot truncation that
+    costs a GPU sync, so those keep the kernel path.
     """
     if not envs.SGLANG_OPT_MLA_LORA_DENSE_GEMM.get():
-        return False
-    if batch_info.permutation is not None:
         return False
     return (batch_info.num_segments or batch_info.bs) == 1
 
