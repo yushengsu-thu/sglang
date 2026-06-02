@@ -170,3 +170,22 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
 - **Harness fix:** EP variant flags reduced to `--ep-size 8` (+ optional `--init-expert-location` for
   the balancedness fallback). Removed the `--moe-runner-backend`/`--moe-a2a-backend`/`--deepep-mode`
   overrides. EP8 now differs from the tp8 control by exactly one flag.
+
+### 2026-06-02 — switch to the hardened kimi-regression harness (user direction)
+- User pointed me at `kimi-regression/SKILL.md` to drive the Kimi run. Its `run_kimi.sh` is the
+  hardened base-vs-variant harness (acc + bench + profile in one 2-node run). Crucially its
+  **robustness #1 explains my earlier "Killed: 9" death**: orphaned local `kubectl exec … launch_server`
+  clients race a new launch → its `kill_all` does `pkill -9 -f "kubectl exec.*launch_server"` + loops
+  nvidia-smi until compute-apps==0 on BOTH nodes before launching. My hand-rolled monolithic script
+  lacked this. Switching to it.
+- Copied `kimi-regression/scripts/run_kimi.sh` → `run_kimi_epreg.sh` and edited the cell block for THIS
+  A/B: **base** = no-LoRA `--tp 8` (today's baseline); **variant** = no-LoRA + **only `--ep-size 8`**
+  (same flashinfer_trtllm + a2a=none). Both cells = same commit (`__bench_target` = a20eb4601 on pods).
+- Edits: `BENCH_BS="16 32 64 128 256"` + `--cuda-graph-max-bs 256` (larger-bs sweep — EP amortizes at
+  big bs); ported the `~/.cargo/env` fix into the skill's `checkout()` (it doesn't source cargo either).
+- Kept the skill's hardening untouched: 40-min cold-autotune wait, retry-once launch, mem-fraction 0.83,
+  NEVER --disable-flashinfer-autotune, --show-report bench, asymmetric 8-rank trace pull, drop_caches.
+- acc (logprobs) now a real regression check: EP8 vs TP8 are numerically equivalent, expect diff within
+  the ~0.30 noise floor. summary.py (ACC_TOL=0.30) + decode_isolate.py run locally after.
+- DECODE-THPT-RULE (skill §304) reaffirms: report server-log decode thpt, not just bench e2e.
+- Next: run `run_kimi_epreg.sh` in background (its kill_all clears my orphaned tp8 launcher first).
