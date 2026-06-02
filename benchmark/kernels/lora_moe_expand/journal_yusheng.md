@@ -182,3 +182,18 @@ Neutral-to-worse for small-N (qwen N=2048: keep 128). This must be N-gated in th
 > branch. Surfacing to the user before shipping a duplicate launcher change + burning the
 > full 3-model regression. My added value here: the empirical proof that the kernel-structure
 > rewrites (C1/C5) do NOT help, i.e. block_n=512 is the practical ceiling.
+
+## DECISION (2026-06-02) — investigation report, no duplicate ship
+User chose to **close PR #14 as the empirical investigation report**: it proves the
+kernel-structure rewrites (C1 N-loop, C5 transposed-B) do NOT beat the per-tile baseline and
+that `block_n=512` is the practical memory-bound ceiling. We do **not** duplicate the
+`block_n=512` launcher change here and do **not** run the full 3-model regression — the actual
+config ship goes through the existing `lora-expand-block-n-tune` branch. The two experimental
+kernels stay **env-gated OFF** (`SGLANG_LORA_EXPAND_NLOOP`, `SGLANG_LORA_EXPAND_LOAD_B_TRANS`)
+as reproducible negative-result testbed for any future attempt.
+
+### Node released
+- Pod `sglang-expand-opt-yushengsu-20260602-210212` **deleted** (no regression/benchmark run,
+  per the investigation-report scope). Other tasks' pods untouched.
+
+### Status: DONE (investigation complete; PR #14 updated; no regression by design).
