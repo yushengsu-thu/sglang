@@ -147,3 +147,11 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
   `both` runs the worker first → it aborted before the head even ran, hence head had no pip.log.)
   Confirmed cargo present at `/root/.cargo/bin/cargo` (1.96.0); `. ~/.cargo/env` fixes PATH.
   **Fix:** `checkout()` now sources `~/.cargo/env` before `pip install -e`. Re-running tp8.
+- **tp8 run #2:** cargo fix WORKED — `checkout()` rebuilt the editable install and printed
+  `a20eb4601` on both pods. But the monolithic background script then died: a `kubectl exec`
+  right after checkout (a `kill_all`) was `Killed: 9` (SIGKILL on the local kubectl, likely a
+  transient local OOM from stacked execs). No server launched, no server.log, no results.
+  **Decision:** stop using the fragile all-in-one background script; drive launch → bench → profile
+  **step by step** via direct kubectl (more visibility + needed anyway to capture the server-log
+  decode throughput). Both pods are already on `a20eb4601` with the rebuilt editable, so the next
+  step skips checkout and launches the tp8 no-LoRA server directly.
