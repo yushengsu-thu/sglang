@@ -64,7 +64,10 @@ Reference / optimization basis: **jybsuper/sglang PR #12**
 - 2026-06-02: `git worktree add -b lora-moe-expand-kernel-opt …-kernel-opt pr12` — worktree at
   `/Users/yushengsu/Downloads/river/sglang-lora-moe-expand-kernel-opt`, based on `pr12`
   (`a8ada7b9cd`) so UT + bench + `force_block_size_n` knob are present.
-- 2026-06-02: Committed this journal into the repo and opened PR (journal = single source of truth).
+- 2026-06-02: Committed this journal into the repo (`journal_yusheng.md`), pushed branch to
+  `origin` (yushengsu-thu fork), and opened **PR jybsuper/sglang#14**
+  (`yushengsu-thu:lora-moe-expand-kernel-opt` -> `nvfp4-lora`) with done/to-do + perf/acc.
+  Journal = single source of truth.
 
 ## Current results
 
