@@ -38,8 +38,11 @@ ACC_DATA="${LORA_PATH}/compare_sample_train_data.pt"   # ships inside the LoRA a
 #           rank owns 384/8=48 experts). NOT a cutlass/cutedsl swap, NOT deepep. Both cells = same commit.
 # Numerically equivalent (EP vs TP is a math-equivalent expert reshuffle, modulo atomic-add noise) =>
 # the acc logprob diff is a real regression check; expect it within the ~0.30 noise floor.
-BASE_REF=__bench_target;     BASE_LORA=off;    BASE_EXTRA="";            BASE_ENVS=""
-VARIANT_REF=__bench_target;  VARIANT_LORA=off; VARIANT_EXTRA="--ep-size 8"; VARIANT_ENVS=""
+# --- WITH-LoRA A/B (same trtllm LoRA stack on both; variant adds only --ep-size 8) ---
+# base = TP8 + LoRA ; variant = EP8 + LoRA. (no-LoRA TP8/EP8 already measured in a prior RUN_ROOT.)
+LORA_STACK_ENVS="SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1 SGLANG_LORA_TWO_STREAM=1"
+BASE_REF=__bench_target;     BASE_LORA=on;    BASE_EXTRA="--moe-runner-backend sgl_flashinfer_trtllm --lora-use-virtual-experts";              BASE_ENVS="$LORA_STACK_ENVS"
+VARIANT_REF=__bench_target;  VARIANT_LORA=on; VARIANT_EXTRA="--moe-runner-backend sgl_flashinfer_trtllm --lora-use-virtual-experts --ep-size 8"; VARIANT_ENVS="$LORA_STACK_ENVS"
 cell_ref(){   [ "$1" = base ] && echo "$BASE_REF"   || echo "$VARIANT_REF"; }
 cell_lora(){  [ "$1" = base ] && echo "$BASE_LORA"  || echo "$VARIANT_LORA"; }
 cell_extra(){ [ "$1" = base ] && echo "$BASE_EXTRA" || echo "$VARIANT_EXTRA"; }
