@@ -234,3 +234,22 @@ graph and times replay (matches serving). S=64 (real bs=64 per TP rank):
   (validates the user's hypothesis), but in the shipped two-stream config it does NOT improve E2E. Flag
   stays default-off. Options: (a) accept (document the kernel, keep off); (b) make fused overlap too;
   (c) compare both non-overlapped to confirm the kernel win in that regime; (d) target a bigger decode lever.
+
+## 11. (2026-06-03 01:34) SPLIT single-LoRA step_a/b (keep two-stream overlap) — the real E2E lever
+
+User direction: keep the A/B split (so two-stream overlaps step_a behind the base bmm), but make step_a
+single-LoRA-fast so it fully hides. Added split single-LoRA kernels (single_a_q/b_q/a_v/b_v) — the two
+halves of the fused kernel kept separate; step_a writes the rank intermediate to HBM (so step_b can be a
+separate kernel / on a different stream). bench_kv_b_split.py (cuda-graph regime, bit-exact maxΔ=0):
+
+| step | CURRENT us | single us | base-bmm budget us | effect |
+|---|---|---|---|---|
+| step_a_q (overlapped) | 6.16 | 4.11 | 4.12 | fully hides (spill 2.0->~0) |
+| step_a_v (overlapped) | 10.26 | 6.01 | 5.05 | spill 5.2->~1 |
+| step_b_q (serial)     | ~6   | 6.16 | -   | ~= |
+| step_b_v (serial)     | ~6   | 4.11 | -   | faster |
+
+=> Keeping the split + single-LoRA step_a cuts the NON-HIDDEN step_a spill ~7us -> ~1us/layer (the fused
+version forfeited this by running serially). This is the real E2E lever.
+- Next: wire split single-LoRA kernels into the two-stream prepare(step_a, side stream)/apply(step_b)
+  path for single-LoRA; keep fused only as a no-two-stream fallback. Then Kimi E2E to measure the win.
