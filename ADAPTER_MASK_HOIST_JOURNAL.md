@@ -50,11 +50,13 @@ scatter path), incl. the persistent cuda-graph buffer. So `adapter_enabled[i]==1
 ## 3. RESULTS SO FAR
 
 ### Qwen — PASS on both models (acc within noise floor; perf faster)
-| Model | variant-vs-base mean\|Δlogprob\| | noise floor (base-vs-base) | acc verdict |
-|-------|---------------------------------|----------------------------|-------------|
-| Qwen3-VL-30B-A3B-FP8 | 0.0556 (max 1.59) | 0.0581 | within noise → no regression |
-| Qwen3.5-35B-A3B-FP8  | 0.0242 (max 2.06) | 0.0227 | within noise → no regression |
+Accuracy measured at **bs=1** (single-sequence per-token logprob capture):
+| Model | tokens (bs=1) | variant-vs-base mean\|Δlogprob\| | noise floor (base-vs-base) | acc verdict |
+|-------|---------------|---------------------------------|----------------------------|-------------|
+| Qwen3-VL-30B-A3B-FP8 | 1820 | 0.0556 (max 1.59) | 0.0581 | within noise → no regression |
+| Qwen3.5-35B-A3B-FP8  | 31999 | 0.0242 (max 2.06) | 0.0227 | within noise → no regression |
 
+Perf — bench e2e, in/out 2048/2048, per batch size:
 | Model | bs | base lat | variant lat | base out tok/s | variant out tok/s |
 |-------|----|----------|-------------|----------------|-------------------|
 | Qwen3-VL | 16 | 15.63s | 15.06s (−3.6%) | 2142 | 2226 (+3.9%) |
@@ -68,9 +70,9 @@ scatter path), incl. the persistent cuda-graph buffer. So `adapter_enabled[i]==1
 
 ### Kimi-K2.5-NVFP4 — DONE (2026-06-02 22:44) on dev-cu13, 2-node tp8
 Both cells LoRA-on trtllm + virtual-experts (+ two-stream envs), differ only by commit.
-- **Accuracy** (variant vs base, 1808 tok): mean|Δlogprob| = **0.2873**, max 4.24. Kimi's atomic-add
-  noise floor is ~0.26–0.30 (documented) → within noise → **no regression / no-op**.
-- **Decode throughput** (server-log `gen throughput (token/s)`, median; NOT e2e):
+- **Accuracy** at **bs=1** (variant vs base, 1808 tok): mean|Δlogprob| = **0.2873**, max 4.24. Kimi's
+  atomic-add noise floor is ~0.26–0.30 (documented) → within noise → **no regression / no-op**.
+- **Decode throughput** (server-log `gen throughput (token/s)`, median; NOT e2e), per batch size:
   | bs | base | variant | Δ% |
   |----|------|---------|-----|
   | 16 | 675.5 | 660.9 | −2.2% |
