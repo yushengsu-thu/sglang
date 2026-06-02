@@ -236,3 +236,25 @@ when it comes up, before drawing any comparison.
     1. Verify EP8 launch cmd from its live process (`ep-size 8`, resolved flashinfer_trtllm + a2a=none).
     2. Per-bs table: TP8 vs EP8 **server-log decode thpt (token/s)** + bench e2e + acc(Δlogprob vs 0.30).
     3. Read whether EP8 closes the gap at large bs; if imbalance shows, run fallback (a)/(b) and append.
+
+### 2026-06-02 23:18 (KST) — base(TP8) done; harness bug killed the EP8 cell; re-running EP8
+- base(TP8) READY (~982s cold autotune), acc done (23:08), **bench bs16..256 done (23:13)**, graph-on
+  profile captured. Then the run **died** at `pull_traces` base graph-on with
+  `run_kimi_epreg.sh:139: cell: unbound variable` → base graph-off + the **entire EP8 cell never ran**.
+  Root cause: `local` expands ALL its arg-words before binding any, so `local cell=$1 … src=…${cell}…`
+  references `cell` while still unbound under `set -u`. **Fixed:** split into two `local` lines; added a
+  `CELLS` env to re-run a subset. Pulled base's 8 graph-on traces from the pods before re-running.
+- **BASE (TP8, no-LoRA) results** — bench e2e vs server-log decode thpt agree (DECODE-THPT-RULE ✓):
+
+  | bs | bench output_thpt (tok/s) | server-log decode (steady max / avg) | e2e latency (s) |
+  |----|------|------|------|
+  | 16  | 1259.4 | 1271.7 / 1190.0 | 26.73 |
+  | 32  | 2145.0 | 2185.5 / 2105.0 | 31.82 |
+  | 64  | 3466.9 | 3536.3 / 3402.8 | 40.08 |
+  | 128 | 5594.1 | 5771.5 / 5515.7 | 50.74 |
+  | 256 | 8377.2 | 8835.0 / 8277.6 | 69.98 |
+
+  acc logprobs captured (`kimi/base/acc/logprobs.json`) for the EP8-vs-TP8 regression check.
+- 23:18: re-running **only the EP8 cell** (`CELLS=variant`, bg `bzdh6ip0r`); its `kill_all` stops the
+  still-running base tp8 server, then launches EP8 (warm — autotune cache shared, so READY fast).
+  Will verify `--ep-size 8` from the live process, then append the EP8 table + TP8-vs-EP8 delta.
