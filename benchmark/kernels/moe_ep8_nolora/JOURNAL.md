@@ -198,3 +198,25 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
   both nodes** — the skill's `kill_all` reaped my earlier orphaned tp8 launcher (robustness #1 worked).
 - base cell now in checkout (pip install + cargo fix) → base graph-ON launch → ~20min cold fp4 autotune.
 - (Reminder applied from here on: every journal entry carries date + time.)
+
+### 2026-06-02 22:53 (KST) — VERIFIED launch commands (from the live process, not the script)
+base cell currently in cold `fp4_gemm` autotune (i=27, 7 sglang procs). Verified on the head pod:
+
+**TP8 (base / control)** — `ps args` of the live rank-0 process:
+```
+python3 -m sglang.launch_server --model-path /root/Kimi-K2.5-NVFP4 --tp 8 --nnodes 2 \
+  --dist-init-addr mnnvl-kimi-<ID>-0.mnnvl-kimi-<ID>-head:20000 --host 0.0.0.0 --port 30000 \
+  --quantization modelopt_fp4 --mem-fraction-static 0.83 --cuda-graph-max-bs 256 --trust-remote-code \
+  --max-prefill-tokens 40960 --chunked-prefill-size 40960 --node-rank 0
+```
+env prefix (from `/proc/<pid>/environ`), under `numactl --membind=0,1`:
+`NCCL_MNNVL_ENABLE=1 NCCL_NVLS_ENABLE=1 NCCL_CUMEM_ENABLE=1 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=false PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+Resolved server_args (from server.log): **`tp_size=8, ep_size=1, moe_a2a_backend='none', moe_runner_backend='flashinfer_trtllm'`** ✓ (trtllm-gen, a2a none).
+
+**EP8 (variant)** — identical command **+ `--ep-size 8`** (nothing else changes). The flashinfer_trtllm
+auto-selection ignores ep_size, so the resolved backend stays `flashinfer_trtllm` + `a2a='none'`, only
+`ep_size=8`. NOT yet launched (cell 2) → will re-verify `ep_size=8` + backend from its live process/log
+when it comes up, before drawing any comparison.
+
+- After the full run completes: compare TP8 vs EP8 (server-log decode thpt per bs + bench e2e + acc vs
+  noise floor + decode-isolated kernels) and post the comparison to the PR description.
