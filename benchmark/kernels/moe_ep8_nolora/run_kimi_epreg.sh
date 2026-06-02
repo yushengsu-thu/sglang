@@ -136,7 +136,10 @@ dl(){ mkdir -p "${LOCAL_OUT}"; kubectl exec "${HEAD_POD}" -- bash -lc "cd ${OUTR
 #   graph-OFF -> ONLY TP0 (==tp0ep0) from head. ~39M/rank; graph-off is for kernel STRUCTURE, 1 rank suffices.
 # Layout: ${LOCAL_OUT}/<cell>/traces/graph_{on,off}/bs16_TP<r>.trace.json.gz (+ server_args.json on graph-on)
 pull_traces(){  # $1=cell  $2=on|off
-  local cell=$1 g=$2 src="${OUTROOT}/${cell}/profile_graph_${g}/bs16" dst="${LOCAL_OUT}/${cell}/traces/graph_${g}" ranks pod r s
+  # NOTE: assign cell/g on their OWN `local` first — `local` expands ALL its arg words before binding
+  # any, so referencing ${cell}/${g} in a later same-line assignment errors under `set -u` (unbound).
+  local cell=$1 g=$2
+  local src="${OUTROOT}/${cell}/profile_graph_${g}/bs16" dst="${LOCAL_OUT}/${cell}/traces/graph_${g}" ranks pod r s
   mkdir -p "$dst"
   [ "$g" = on ] && ranks="0 1 2 3 4 5 6 7" || ranks="0"
   for r in $ranks; do
@@ -176,8 +179,8 @@ run_cell(){  # $1=cell (base|variant)  — runs ALL THREE tests
 }
 
 prewarm
-run_cell base
-run_cell variant
+# CELLS lets you re-run a subset after a partial failure (e.g. CELLS=variant). Default: both.
+for __c in ${CELLS:-base variant}; do run_cell "$__c"; done
 kill_all
 find "${LOCAL_OUT}" -name '*.trace.json.gz' -exec gzip -t {} + 2>/dev/null && echo "traces integrity OK"
 echo "[$(date +%H:%M:%S)] kimi DONE (all local) -> ${LOCAL_OUT}" | tee -a "${RUN_ROOT}/progress.log"
