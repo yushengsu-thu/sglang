@@ -71,5 +71,48 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
 - Created worktree `sglang-moe-ep8-nolora-bench` + branch `moe-ep8-nolora-bench` off `ac0fa6d3ee`.
 - Verified EP server-args in this build: `--ep-size` (∈{1,tp}), `--moe-a2a-backend`
   {none,deepep,flashinfer,…}, `--init-expert-location` (default `trivial`).
-- Next: author the EP8 no-LoRA launch variant of `run_kimi.sh`, commit journal + script, open PR,
-  then launch the 2-node Kimi pod and run.
+- Authored `run_kimi_ep_vs_tp.sh` (no-LoRA, VARIANT=tp8|ep8, larger-bs sweep, EP backend env knobs).
+- Committed JOURNAL + harness (`b62becfdb6`), pushed to `origin` (yushengsu-thu fork),
+  opened **PR jybsuper/sglang#18** against `nvfp4-lora`.
+
+---
+
+## STATUS SNAPSHOT — 2026-06-02 (precise: done / now / next)
+
+### What has been done so far
+1. **Read `skill.md`** and the Kimi section of `sglang-lora-base-perf-benchmark.md` §3 — confirmed the
+   "best no-LoRA" TP8 config is the `nvidia/Kimi-K2.5-NVFP4` 2-node (4+4 GPU MNNVL) launch at
+   `--tp 8` with **no EP**, default MoE backend. This is the control we want to beat.
+2. **Synced base branch:** `git fetch jybsuper` → `lora-opti-nvfp4` is `0 0` vs `jybsuper/nvfp4-lora`
+   (already in sync, HEAD `ac0fa6d3ee`).
+3. **Created isolated worktree + branch:** `sglang-moe-ep8-nolora-bench` / branch
+   `moe-ep8-nolora-bench` off `lora-opti-nvfp4` (so it doesn't collide with other agents on the
+   shared repo).
+4. **Verified EP server-args exist** in this build (`server_args.py`): `--ep-size` (must be 1 or
+   tp_size → EP8 is the only EP option at tp8), `--moe-a2a-backend` {none,deepep,flashinfer,…},
+   `--moe-runner-backend` (flashinfer_cutedsl/cutlass support fp4 EP), `--init-expert-location`.
+5. **Wrote the experiment harness** `benchmark/kernels/moe_ep8_nolora/run_kimi_ep_vs_tp.sh`:
+   no-LoRA baseline only, `VARIANT=tp8` (control) vs `VARIANT=ep8`, larger-bs sweep (16/32/64/128/256
+   with `--cuda-graph-max-bs 256`), EP backend choices as env vars so they can be tuned on-pod
+   without re-pushing, and an `--init-expert-location` hook for the balancedness fallback.
+6. **Wrote this JOURNAL**, committed both (`b62becfdb6`), pushed to `origin`, **opened PR #18**.
+
+### Current status
+- **No GPU nodes launched yet.** Nothing has run on hardware — there are **no bench or profile
+  numbers yet**. Everything so far is repo/branch/harness setup + the PR.
+- The EP8 backend combo (`MOE_RUNNER=flashinfer_cutedsl`, `MOE_A2A=deepep`, `DEEPEP_MODE=low_latency`)
+  is a **first guess** for cross-node NVFP4 EP and is expected to need on-pod iteration.
+- k8s `ID` not yet chosen (will be `yushengsu-<date>-<time>` at launch).
+
+### What's next (in order)
+1. Pick `ID=yushengsu-<date>-<time>`; apply the 2-node Kimi pod spec (`kimi-2node.yaml` from the perf
+   skill §3.1), wait for setup, build+inject this branch into both pods, ghost-check + clean HBM.
+2. **Run `VARIANT=tp8`** (control) — bench + profile the no-LoRA baseline at bs 16…256. Pull traces.
+3. **Run `VARIANT=ep8`** — same workload. Debug the EP launch (a2a / runner backend) until it serves;
+   record the working flag combo here.
+4. **Compare:** EP8 vs TP8 decode step time + the two "not sliced" `_moe_lora_*` kernels, per bs.
+   Confirm/deny the "EP8 fine at large bs" hypothesis.
+5. **If EP8 looks bad → balancedness:** retry with `--init-expert-location <dist>`, or drop to 4 GPU
+   (tp=ep=4). Record deltas.
+6. Write findings + numbers into this JOURNAL and the PR description, **release the nodes**, push the
+   results commit.
