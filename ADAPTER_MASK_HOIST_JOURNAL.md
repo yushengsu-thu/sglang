@@ -1,7 +1,12 @@
 # adapter_enabled mask-hoist — task journal (DID / NOW / NEXT)
 
 Branch: `lora-adapter-mask-hoist` @ `2c6adb4e` (base `lora-opti-nvfp4` @ `ac0fa6d3`). PR: jybsuper/sglang#15.
-Last updated: 2026-06-02 22:47 (local).
+Last updated: 2026-06-02 23:32 (local).
+
+> 2026-06-02 23:32 — RIGOROUS RE-TEST in progress (Qwen3-VL-30B + Kimi-K2.5-NVFP4, both
+> sgl_flashinfer_trtllm): capturing **extend(prefill) / decode / e2e** throughput, **3 runs per cell**,
+> base's 3 runs = perf noise floor. Supersedes the earlier single-run e2e Qwen numbers below (which
+> mixed metrics and had no perf noise floor). Results table will replace the Performance section when done.
 
 ---
 
