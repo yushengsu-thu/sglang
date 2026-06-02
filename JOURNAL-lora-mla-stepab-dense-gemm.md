@@ -185,3 +185,17 @@ graph and times replay (matches serving). S=64 (real bs=64 per TP rank):
 - **Fused win is REAL under graph** (not launch overhead): lora-v 14.4→6.2us (2.3x) lands ON the base
   full-gemm floor; lora-q 10.3→6.2us (1.7x). Combined v+q ~24.6→~12.3us (~2x).
 - LESSON: always bench in the cuda-graph regime for decode kernels; eager overstates and can mislead.
+
+## 8. (2026-06-03 00:45) Kernel verified (graph-safe) + WIRED into serving + E2E running
+
+- **Graph-safe scaling**: kernels now take `scaling` as a 1-elem tensor pointer (`tl.load`), no `.item()`
+  — required under cuda-graph. Re-verified: bit-exact (maxΔ=0, S=16/32/64); graph regime lora-v 2-kernel
+  16.4us ≈ profile, FUSED lora-v 6.16us (2.7x, == base floor), FUSED lora-q 6.16us.
+- **Wired** (`c4337dcf47`): `SGLANG_OPT_MLA_LORA_DENSE_GEMM` now routes `apply_q/v_correction` to
+  `fused_q/v_correction` (was the shelved torch-bmm). Two-stream prepare returns None for single-LoRA
+  (fused kernel is monolithic → runs serially in apply). Removed unused torch `_dense_step_*` helpers +
+  dead apply branches. Multi-LoRA → Triton step-kernel fallback.
+- **E2E running** (`run_kimi_e2e.sh`, both bundles @ c4337dcf47): base (flag off = Triton step kernels)
+  vs variant (flag on = fused). Captures per-cell (a) bench e2e, (b) **server-log decode thpt**, (c) graph-on
+  traces (to confirm `_step_*` replaced by `_fused_q/v_kernel`). Skips graph-off to save time.
+- Expected: acc within noise; trace `_step_*`→0 in variant + `_fused_*` present; decode thpt slightly up.
