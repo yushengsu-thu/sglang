@@ -28,6 +28,13 @@ GPU: 1× NVIDIA GB200 (leira / Crusoe, pod `sglang-lora-tom` on node `np-67167b3
    - `--model {qwen35, kimi-k25}` preset (per-flag overrides win).
    - `--mode sweep` now also sweeps `BLOCK_SIZE_N ∈ {64,128,256,512}` (divisors of N) via
      `force_block_size_n`; `--block-n` forces it in single-config modes.
+   - **`--config {production, manual}` (default `production`)**: by default `--mode bench`/
+     `profile` reproduce the config production launches — `production_config()` queries the same
+     `try_get_optimal_moe_config` path `_get_stage_config` uses (BLOCK_SIZE_N left to the
+     launcher). So **the default run matches the e2e kernel**, not a hand-picked config.
+     `--config manual` uses the explicit `--block-*` / `--group-m` / `--num-warps` flags (A/B,
+     tuning). Verified default numbers: **kimi-k25 → 27.3 µs** (block_m=16, block_n=128, warps=4;
+     ≈ e2e 25.1 µs); **qwen35 → 6.49 µs** (same config).
 
 ## Are PR #11's shapes wrong for Kimi? — Yes, they were qwen's
 
@@ -91,6 +98,11 @@ was **wrong**: `block_m=64` is the `_get_stage_config` *fallback* used only when
 set and it returns `block_m=16`, giving ~25–27 µs — matching the e2e trace. The corrected win
 from tuning is below.
 
+This also applies to #11's qwen claim: with `--config production`, qwen35 resolves to
+`block_m=16` too (no tuned JSON either) → **6.49 µs**, i.e. qwen production already runs the
+`block_m=16` #11 called "best", not the `block_m=64` it called the default. **For both models the
+real untuned lever is `BLOCK_SIZE_N` (forced 128), not `block_m`.**
+
 ## Results (1× GB200, bs=64, r=16, amortized device time)
 
 ### Correctness (`--mode correctness --model kimi-k25`) — 6/6 PASS
@@ -137,7 +149,7 @@ cd /root/sglang   # pod sglang-lora-tom, branch tom/lora-moe-expand-down-bench
 B=benchmark/kernels/lora_moe_expand/bench_expand_add_down.py
 python3 $B --mode correctness --model kimi-k25                       # 6/6 PASS
 python3 $B --mode sweep       --model kimi-k25                       # BEST bm16 bn512 ~20us
-python3 $B --mode bench       --model kimi-k25 --block-m 16          # production-equiv ~27us (=25.1 e2e)
-python3 $B --mode bench       --model kimi-k25 --block-m 16 --block-n 512   # BEST ~20us
+python3 $B --mode bench       --model kimi-k25                       # default=production ~27us (=25.1 e2e)
+python3 $B --mode bench       --model kimi-k25 --config manual --block-m 16 --block-n 512   # BEST ~20us
 # production config probe: see the python snippet in "The production config" section above.
 ```

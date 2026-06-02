@@ -15,10 +15,17 @@ Two model shapes via ``--model`` (per-flag overrides win):
 
 P0 scope: bs=64, rank=16 first.
 
-  python3 bench_expand_add_down.py --mode bench   --model kimi-k25
+  python3 bench_expand_add_down.py --mode bench   --model kimi-k25   # default: reproduces the
+                                                                     #   PRODUCTION config (e2e kernel)
+  python3 bench_expand_add_down.py --mode bench   --model kimi-k25 --config manual --block-m 16 --block-n 512
   python3 bench_expand_add_down.py --mode correctness --model kimi-k25  # block_m {16,32,64} x bs {16,64}
   python3 bench_expand_add_down.py --mode profile --iters 2   # eager, for ncu
   python3 bench_expand_add_down.py --mode sweep   --model kimi-k25      # block_m x block_n x group_m x warps
+
+By default ``--mode bench``/``profile`` use ``--config production``: the BLOCK_SIZE_M/GROUP_SIZE_M/
+num_warps that ``_get_stage_config`` -> ``try_get_optimal_moe_config`` picks at runtime (BLOCK_SIZE_N
+left to the launcher), so the headline number matches the e2e kernel. ``--config manual`` uses the
+explicit ``--block-*`` / ``--group-m`` / ``--num-warps`` flags instead (for A/B and tuning).
 
 ``--mode sweep`` also tunes BLOCK_SIZE_N (the launcher's production default forces 128 for
 N%128==0; the sweep passes ``force_block_size_n`` to explore other tiles — valid for the
@@ -44,6 +51,45 @@ from sglang.srt.lora.triton_ops.virtual_experts import (
     fused_sanitize_expert_ids,
 )
 from sglang.srt.lora.trtllm_moe.specialized_expand import _invoke_moe_lora_expand_add
+
+
+def production_config(num_experts, n, rank, bs, dtype):
+    """The config production actually launches the expand with, so the default bench run
+    reproduces the e2e kernel (not a hand-picked one).
+
+    Mirrors ``_get_stage_config`` (virtual_experts.py): call
+    ``try_get_optimal_moe_config(lora_b_virtual.shape, .., stage_top_k=1, M=bs)`` and, if it
+    raises (e.g. no tuned JSON + server args unset), use the same fallback (BLOCK_SIZE_M=64).
+    BLOCK_SIZE_N is left to the launcher (forced to 128 when N % 128 == 0), so ``force_block_n``
+    stays None. Returns ``(block_m, group_m, num_warps)``.
+    """
+    import functools
+
+    try:
+        from sglang.srt.server_args import (
+            ServerArgs,
+            get_global_server_args,
+            set_global_server_args_for_scheduler,
+        )
+
+        try:
+            get_global_server_args()
+        except Exception:
+            set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+            get_config_dtype_str,
+            try_get_optimal_moe_config,
+        )
+
+        weight_shape = (num_experts, n, rank)
+        config_dtype = get_config_dtype_str(dtype=dtype)
+        cfg = functools.partial(
+            try_get_optimal_moe_config, weight_shape, weight_shape, 1, config_dtype
+        )(bs)
+        return cfg["BLOCK_SIZE_M"], cfg.get("GROUP_SIZE_M", 1), cfg.get("num_warps", 4)
+    except Exception:
+        # _get_stage_config's fallback when try_get_optimal_moe_config raises.
+        return 64, 1, 4
 
 
 def make_inputs(bs, num_experts, top_k, n, rank, dtype, device):
@@ -202,6 +248,9 @@ def main():
     )
     # Model presets set (num_experts, n, top_k); per-flag overrides below win.
     ap.add_argument("--model", choices=["qwen35", "kimi-k25"], default="qwen35")
+    # bench/profile config source: "production" reproduces what _get_stage_config launches
+    # (the e2e kernel); "manual" uses the --block-m/--block-n/--group-m/--num-warps flags.
+    ap.add_argument("--config", choices=["production", "manual"], default="production")
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--num-experts", type=int, default=None)
     ap.add_argument("--top-k", type=int, default=None)
@@ -266,10 +315,20 @@ def main():
         args.bs, args.num_experts, args.top_k, args.n, args.rank,
         torch.bfloat16, dev,
     )
-    routing = build_v1_routing(topk_ids, tlm, args.num_experts, args.block_m)
+    # bench/profile: by default reproduce the config production launches (so the headline
+    # number matches the e2e kernel); --config manual uses the explicit flags instead.
+    if args.config == "production":
+        eff_block_m, eff_group_m, eff_warps = production_config(
+            args.num_experts, args.n, args.rank, args.bs, torch.bfloat16
+        )
+        eff_force_block_n = None  # let the launcher force 128 (N % 128 == 0), as production does
+    else:
+        eff_block_m, eff_group_m, eff_warps = args.block_m, args.group_m, args.num_warps
+        eff_force_block_n = args.block_n
+    routing = build_v1_routing(topk_ids, tlm, args.num_experts, eff_block_m)
     fn = lambda: expand(
-        inter, lora_b, topk_ids, tkw, routing, args.block_m,
-        group_m=args.group_m, num_warps=args.num_warps, force_block_n=args.block_n,
+        inter, lora_b, topk_ids, tkw, routing, eff_block_m,
+        group_m=eff_group_m, num_warps=eff_warps, force_block_n=eff_force_block_n,
     )
 
     if args.mode == "correctness":
@@ -315,14 +374,14 @@ def main():
         torch.cuda.synchronize()
     else:
         ms = bench_ms(fn)
-        eff_block_n = args.block_n if args.block_n is not None else (
+        eff_block_n = eff_force_block_n if eff_force_block_n is not None else (
             128 if args.n % 128 == 0 else args.block_n
         )
         print(
-            f"BENCH expand_add down model={args.model} bs={args.bs} r={args.rank} N={args.n} "
-            f"experts={args.num_experts} top_k={args.top_k} block_m={args.block_m} "
-            f"block_n={eff_block_n} group_m={args.group_m} warps={args.num_warps}: "
-            f"{ms * 1000:.2f} us (amortized true device time)"
+            f"BENCH expand_add down model={args.model} config={args.config} bs={args.bs} "
+            f"r={args.rank} N={args.n} experts={args.num_experts} top_k={args.top_k} "
+            f"block_m={eff_block_m} block_n={eff_block_n} group_m={eff_group_m} "
+            f"warps={eff_warps}: {ms * 1000:.2f} us (amortized true device time)"
         )
 
 
