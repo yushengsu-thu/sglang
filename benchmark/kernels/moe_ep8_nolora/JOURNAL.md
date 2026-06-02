@@ -309,3 +309,33 @@ when it comes up, before drawing any comparison.
   cache (`/root/.cache/.../rank_tp*.json`); later EP8 launches load it -> no JIT skew -> synchronized.
   The hostPath `/root/.cache` mount persists it for future pods.
 - Re-running EP8 (`CELLS=variant`, bg `bj5eiz3y0`); monitoring with the STUCK-CHECK rule.
+
+### 2026-06-03 00:55 (KST) — RESULTS: TP8 vs EP8 (no-LoRA), + EP8 crashes during bench at bs>=32
+- The timeout fix WORKED for the desync: EP8 ranks re-synced (both hit 9/20→10/20→20/20 in lockstep)
+  and EP8 reached READY + ran acc + bench. BUT the **graph-on server then crashed during the bench**:
+  bs16 completed, bs32 died **mid-generation** (server-log decode stopped at n=26/~51 steps), and
+  bs64/128/256 all got `ConnectionError: port 30000 connection refused` (server gone).
+
+**TP8 vs EP8 — no-LoRA decode throughput (token/s):**
+
+| bs | TP8 server / bench | EP8 server / bench | EP8/TP8 |
+|----|------|------|------|
+| 16  | 1272 / 1259 | 1240 / 1225 | ~0.97 (EP8 ~3% slower) |
+| 32  | 2186 / 2145 | 2164 / (crashed mid-bench) | ~0.99 |
+| 64  | 3536 / 3467 | **server crashed** | — |
+| 128 | 5772 / 5594 | **server crashed** | — |
+| 256 | 8835 / 8377 | **server crashed** | — |
+
+- **acc (EP8 vs TP8, numerically-equivalent regression check):** mean|Δlogprob| = **0.1138** over 1808
+  tokens (max 7.73 = single-token outlier), **well within the ~0.30 noise floor** → EP8 is numerically
+  correct, no accuracy regression.
+
+**Findings:**
+1. **EP8 gives NO throughput win on the no-LoRA baseline** — at bs16/32 EP8 ≈ TP8 (marginally slower).
+   Expected: for no-LoRA the base MoE expert GEMMs are large/compute-bound, so TP8→EP8 just reshuffles
+   work and the EP all-to-all overhead offsets the per-rank compute reduction. The P0 "TP tax" lives in
+   the **LoRA kernels**, not the base MoE — so EP only pays off once the LoRA kernels ride the EP layout.
+2. **EP8 is unstable** — the graph-on server crashed during the bs32 bench, so the larger-bs numbers
+   (64/128/256, the whole point) are unmeasured. Crash cause not yet captured (server.log was
+   overwritten by the graph-off relaunch). Next: re-launch EP8 (autotune cache is now WARM → fast) and
+   re-bench bs>=32, capturing the crash reason this time.
