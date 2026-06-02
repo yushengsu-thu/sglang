@@ -339,3 +339,29 @@ when it comes up, before drawing any comparison.
    (64/128/256, the whole point) are unmeasured. Crash cause not yet captured (server.log was
    overwritten by the graph-off relaunch). Next: re-launch EP8 (autotune cache is now WARM → fast) and
    re-bench bs>=32, capturing the crash reason this time.
+
+### 2026-06-03 01:08 (KST) — CORRECTED RESULT: EP8 crosses over & WINS at large bs (warm-cache relaunch)
+- Relaunched EP8 from the now-WARM autotune cache → READY in **~240s** (vs ~20min cold; option-1 confirmed)
+  and benched bs>=32 with server.log kept per-bs. EP8 completed bs32/64/128 cleanly (each `/generate`
+  returned 200 OK, decode steady-state captured); the server then **shut down between benches**
+  ("leaked semaphore at shutdown") before bs256 — so the per-bs decode numbers are valid, but the EP8
+  server doesn't survive request-to-request (separate stability bug, not a decode failure).
+
+**TP8 vs EP8 — no-LoRA decode throughput, server-log steady_max (token/s):**
+
+| bs | TP8 | EP8 | EP8/TP8 |
+|----|------|------|------|
+| 16  | 1272 | 1240 | 0.97  (EP8 ~3% slower) |
+| 32  | 2186 | 2166 | 0.99 |
+| 64  | 3536 | **3662** | **1.04**  (EP8 ~4% faster) |
+| 128 | 5772 | **6275** | **1.09**  (EP8 ~9% faster) |
+| 256 | 8835 | _(re-launching warm to measure)_ | — |
+
+- **Headline (answers the P0 question "is EP8 OK at larger bs"): YES — EP8 crosses over around bs≈64 and
+  at bs128 is ~9% FASTER than TP8.** At small bs the EP all-to-all overhead makes EP8 marginally slower;
+  as bs grows the per-rank 1/8 compute reduction wins out. So for the **no-LoRA baseline** EP8 is viable
+  (even favorable) at the large bs we care about — the earlier "no win" read was an artifact of only
+  having bs16/32 before the first crash.
+- **Caveat / open issue:** EP8 server is unstable — it tears down between benches (had to relaunch per
+  measurement). Needs a stability fix before EP8 is production-usable, but the throughput trend is clear.
+- acc unchanged: EP8 vs TP8 mean|Δlogprob| = 0.1138 (within 0.30 floor).
