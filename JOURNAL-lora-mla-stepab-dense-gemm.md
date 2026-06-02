@@ -52,32 +52,37 @@ flag `SGLANG_OPT_MLA_LORA_DENSE_GEMM` (default off).
 
 ## 2. Current status (as of HEAD `1f0a4d9076`)
 
-- **Code:** dense path implemented + 2 correctness fixes (permutation gate, bf16 dtype). Pushed;
-  PR #16 reflects HEAD.
-- **Valid results so far:** only the **base baseline** (Triton kv_b), bench (in=out=2048):
+- **Code:** dense path implemented + 2 correctness fixes (permutation gate, bf16 dtype). Pushed.
+- **Dense now CONFIRMED engaged** (run @ `191c862ee`): variant graph-on trace `_step_a_q/_b_q/_a_v/_b_v`
+  counts = **0** (base = 671 each) → the four Triton kv_b kernels are gone, replaced by dense bmm.
+  Launch + cuda-graph capture succeeded (the dtype fix held). acc + bench done.
+- **PRELIMINARY numbers — DO NOT TRUST YET** (base bench is ~1 h stale, different cluster conditions;
+  swings are too large/inconsistent for a few-µs/layer change → re-measuring back-to-back):
 
-  | bs | output tput (tok/s) | ITL (ms) |
-  |---|---|---|
-  | 16 | 672 | 23.82 |
-  | 32 | 1210 | 26.45 |
-  | 64 | 2080 | 30.77 |
+  | bs | base out tput | variant(dense) out tput | base ITL | variant ITL | e2e Δ |
+  |---|---|---|---|---|---|
+  | 16 | 672 | 770 | 23.82 | 20.78 | +14.7% (suspiciously large) |
+  | 32 | 1210 | 1303 | 26.45 | 24.56 | +7.7% |
+  | 64 | 2080 | 1995 | 30.77 | 32.07 | −4.1% (dense slower at large bs) |
 
-- **No valid dense-vs-Triton numbers yet** — every variant run so far was either a no-op (gate bug) or
-  crashed (dtype bug). Both bugs are now fixed but the fixed variant has **not** completed a run.
-- **Pods:** still up (`mnnvl-kimi-ys-mla-0602-1754-0/1`), GPUs idle/clean.
+  variant server-log decode thpt ≈ 1980–1996 tok/s (bs64 phase; matches its e2e 1995). Base server-log
+  decode thpt was overwritten → must re-capture for a fair A/B.
+- **Coherent hypothesis (unconfirmed):** dense helps small-batch decode (the kv_b step kernels were a
+  fixed serial overhead) and hurts large-batch (bmm scales with rows + processes padded rows). But the
+  +15% magnitude is too big to accept without a controlled re-measure.
+- **Pods:** up (`mnnvl-kimi-ys-mla-0602-1754-0/1`).
 
 ## 3. Next steps
 
-1. Rebuild + re-inject the variant bundle at `1f0a4d9076`; re-run the **variant cell only** (base
-   results are valid and reused).
-2. **Verify dense actually engaged** via traces: `_step_a_q/_b_q/_a_v/_b_v` counts should drop to ~0 in
-   variant (replaced by bmm), unlike the no-op run.
-3. **Accuracy:** `summary.py` — dense vs base logprob |Δ| must stay within the ~0.30 noise floor
-   (also guards the cuda-graph padding-row question, since dense processes padded rows the kernel masks).
-4. **Perf verdict:** `decode_isolate.py` — decode-isolated kv_b kernel time, dense bmm vs Triton
-   `_step_*`. This is the real signal (E2E delta is small; kv_b is a few µs/layer).
-5. Decide keep-vs-drop the flag based on (3)+(4); update PR. Release pods. (Secondary: MoE shared
-   experts dense gemm — only if the step kernels show a win.)
+1. **Controlled re-measurement (in progress):** re-run base AND variant back-to-back on the same pods
+   (eliminate the 1 h-stale-base bias), capturing for BOTH cells (a) bench e2e `--show-report` AND
+   (b) **server-log decode throughput** (`gen throughput (token/s)` lines) — not e2e alone.
+2. **Accuracy:** `summary.py` — dense vs base logprob |Δ| within ~0.30 noise floor (also guards the
+   cuda-graph padding-row question; dense processes padded rows the kernel masks).
+3. **Perf verdict:** `decode_isolate.py` — decode-isolated kv_b kernel time, dense bmm vs Triton
+   `_step_*` (now that dense is confirmed engaged, the `_step_*` rows should vanish in variant).
+4. Decide keep-vs-drop the flag (likely: keep at small bs, fall back to Triton at large bs?); update PR.
+   Release pods. (Secondary: MoE shared experts dense gemm — only if the step kernels show a net win.)
 
 > Detailed chronological log (incl. every command) lives in
 > `river/task-lora-mla-stepab-dense-gemm/journal.md` (local). This file is the PR-facing summary.
