@@ -220,3 +220,19 @@ when it comes up, before drawing any comparison.
 
 - After the full run completes: compare TP8 vs EP8 (server-log decode thpt per bs + bench e2e + acc vs
   noise floor + decode-isolated kernels) and post the comparison to the PR description.
+
+### 2026-06-02 22:59 (KST) — next-step plan locked (no-LoRA TP8→EP8, balancedness fallback)
+- (journal policy: **APPEND**, keep all prior records — do not overwrite.)
+- Restated task: take the best **no-LoRA** baseline, switch MoE **TP8 → EP8**, measure the speed delta,
+  and decide whether EP8 is acceptable **at larger bs**. If EP8 is bad due to **expert imbalance
+  (balancedness)** — i.e. some of the 8 ranks get far more tokens than others, so the slowest rank
+  bottlenecks the all-to-all+compute — then:
+    (a) `--init-expert-location <dist>` to flatten the expert→rank placement, or
+    (b) drop to **4 GPU** (tp=ep=4) which is inherently more balanced (fewer ranks to skew across).
+- Status check at 22:59: base(tp8) autotune advancing normally — **9/20 @ 48s/step** (the 323s step-1
+  was the one-off cold JIT, robustness #2; GPU 0% during JIT is expected, NOT a hang). base READY soon,
+  then acc + bench(16..256) + profile, then the EP8 cell (warm — autotune cache shared).
+- Plan to execute once results land (results appended here + posted to PR #18):
+    1. Verify EP8 launch cmd from its live process (`ep-size 8`, resolved flashinfer_trtllm + a2a=none).
+    2. Per-bs table: TP8 vs EP8 **server-log decode thpt (token/s)** + bench e2e + acc(Δlogprob vs 0.30).
+    3. Read whether EP8 closes the gap at large bs; if imbalance shows, run fallback (a)/(b) and append.
