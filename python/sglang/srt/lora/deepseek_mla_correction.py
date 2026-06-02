@@ -86,8 +86,15 @@ def _dense_step_a_q(q_nope, B, full_K_per_head):
 
 
 def _dense_step_b_q(q_lora_a_hsr, A, scaling, q_nope_out):
-    """step B_q: ``q_nope_out (S,H,kv) += (H,S,rank) @ A(rank,kv) * scaling``."""
-    delta = torch.matmul(q_lora_a_hsr, A * scaling)  # (H,S,kv)
+    """step B_q: ``q_nope_out (S,H,kv) += (H,S,rank) @ A(rank,kv) * scaling``.
+
+    Keep the matmul operands same-dtype (``A`` and ``q_lora_a`` are bf16); apply
+    the fp32 ``scaling`` to the result and cast back (``bf16 * f32 -> f32`` would
+    otherwise make ``A*scaling`` float and mismatch the bf16 matmul). Scaling in
+    fp32 matches the Triton kernel (fp32 accumulator ``*= scaling`` then cast).
+    """
+    delta = torch.matmul(q_lora_a_hsr, A)  # (H,S,kv) bf16
+    delta = (delta * scaling).to(q_nope_out.dtype)
     q_nope_out.add_(delta.transpose(0, 1))
     return q_nope_out
 
@@ -103,7 +110,9 @@ def _dense_step_b_v(attn_lora_a_hsr, B, scaling, base_view, qk_nope, v_head_dim)
     rank = B.shape[-1]
     full_K = qk_nope + v_head_dim
     B_vc = B.view(H, full_K, rank)[:, qk_nope:, :].contiguous()  # (H,v,rank)
-    delta = torch.bmm(attn_lora_a_hsr, (B_vc * scaling).transpose(1, 2))  # (H,S,v)
+    # same-dtype bmm (B_vc, attn_lora_a are bf16); fp32 scaling applied after + cast back.
+    delta = torch.bmm(attn_lora_a_hsr, B_vc.transpose(1, 2))  # (H,S,v) bf16
+    delta = (delta * scaling).to(base_view.dtype)
     base_view.add_(delta.transpose(0, 1))
     return base_view
 
