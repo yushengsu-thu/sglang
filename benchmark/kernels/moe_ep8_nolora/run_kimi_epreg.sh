@@ -53,7 +53,13 @@ LOCAL_OUT="${RUN_ROOT}/kimi"; mkdir -p "$LOCAL_OUT"
 
 COMMON="--model-path ${MODEL_PATH} --tp 8 --nnodes 2 --dist-init-addr ${DIST_INIT} \
 --host 0.0.0.0 --port ${PORT} --quantization modelopt_fp4 --mem-fraction-static 0.83 \
---cuda-graph-max-bs 256 --trust-remote-code --max-prefill-tokens 40960 --chunked-prefill-size 40960"
+--cuda-graph-max-bs 256 --trust-remote-code --max-prefill-tokens 40960 --chunked-prefill-size 40960 \
+--dist-timeout 7200 --watchdog-timeout 7200"
+# ^ EP8 first-launch: each rank cold-JIT-autotunes its OWN 48-expert grouped-GEMM shapes at different
+#   speeds (head stuck on a 340s step-1 while worker raced to 8/20) → they desync and the cross-rank
+#   collective/watchdog aborts before the cache is written. Big dist+watchdog timeouts let the slow rank
+#   finish all 20 steps so the autotune cache gets WRITTEN once (warm). Subsequent EP8 launches load the
+#   cache → no per-rank JIT skew → synchronized. (TP8 doesn't hit this: replicated GEMM, lockstep tune.)
 NCCL="NCCL_MNNVL_ENABLE=1 NCCL_NVLS_ENABLE=1 NCCL_CUMEM_ENABLE=1 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=false PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 
 kh(){ kubectl exec "${HEAD_POD}"   -- bash -lc "$1"; }
