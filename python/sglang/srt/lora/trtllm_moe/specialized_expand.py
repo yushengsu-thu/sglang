@@ -166,7 +166,19 @@ def _invoke_moe_lora_expand_add(
     assert R <= 64, f"direct LoRA expand/add expects rank <= 64, got {R}"
 
     block_size_m = config["BLOCK_SIZE_M"]
-    block_size_n = 128 if N % 128 == 0 else config["BLOCK_SIZE_N"]
+    # The down-proj expand-add (``fuse_sum_all_reduce``) streams each hit expert's [N, R] weight
+    # once and is memory-bound: with K=R (<=64) the dot is a single MMA step with no K-loop to
+    # amortize the per-tile prologue/epilogue over, so for LARGE N a wider N tile cuts the fixed
+    # per-tile cost and coalesces the long weight rows. Sweep (bs64, r16, GB200, block_m=16):
+    # Kimi down N=7168 -> BLOCK_SIZE_N 128->512 = 27->20us (~1.25x e2e). But for small N (Qwen
+    # down N=2048) widening REGRESSES (128=6.46us, 256=7.06, 512=8.99), so only widen to 512 when
+    # N is large (>=4096) and 512-divisible; everything else keeps the default 128. Down-proj is
+    # non-gated (no gate/up boundary) so any divisor of N is valid here; gated gate_up
+    # (fuse_sum_all_reduce=False) is untouched and stays N/2-aligned at 128.
+    if fuse_sum_all_reduce and N >= 4096 and N % 512 == 0:
+        block_size_n = 512
+    else:
+        block_size_n = 128 if N % 128 == 0 else config["BLOCK_SIZE_N"]
     group_size_m = config.get("GROUP_SIZE_M", 1)
     block_size_r = triton.next_power_of_2(R)
 
