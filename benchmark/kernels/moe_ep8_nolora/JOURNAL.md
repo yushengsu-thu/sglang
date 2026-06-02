@@ -365,3 +365,20 @@ when it comes up, before drawing any comparison.
 - **Caveat / open issue:** EP8 server is unstable — it tears down between benches (had to relaunch per
   measurement). Needs a stability fix before EP8 is production-usable, but the throughput trend is clear.
 - acc unchanged: EP8 vs TP8 mean|Δlogprob| = 0.1138 (within 0.30 floor).
+
+### 2026-06-03 01:20 (KST) — bs256 not captured (EP8 instability); starting WITH-LoRA A/B
+- Tried to measure EP8 no-LoRA **bs256**: the warm relaunch loaded + autotuned-from-cache fine but then
+  **died again at the `Capturing batches (bs=256)` / serving boundary** (procs → 1/1, never READY). EP8
+  reproducibly tears down around graph-capture/first-serve. So **bs256 EP8 left unmeasured** — bs16-128
+  already establishes the trend (crossover ~bs64, +9% at bs128). EP8 instability is the real blocker, not
+  the throughput.
+- **Started the WITH-LoRA A/B** (user request: run LoRA under the same TP/EP settings). This is the actual
+  P0 point — the TP "tax" lives in the LoRA grouped-GEMM kernels, so EP should help MORE with LoRA on.
+  - base = **TP8 + LoRA**, variant = **EP8 + LoRA**; identical LoRA stack on both
+    (`--moe-runner-backend sgl_flashinfer_trtllm --enable-lora --max-lora-rank 32 --lora-backend triton
+    --lora-use-virtual-experts --lora-paths alpha=…` + envs `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1
+    SGLANG_LORA_TWO_STREAM=1`); variant adds only `--ep-size 8`.
+  - Fresh RUN_ROOT (`sglang_kimi_eplora_${ID}`) so the no-LoRA raw files aren't clobbered. bg `b54b49e43`.
+  - Note: LoRA uses the `sgl_flashinfer_trtllm` backend = a DIFFERENT autotune cache → expect another
+    cold tune (~20min) for the TP8+LoRA cell; EP8+LoRA may hit the same desync (mitigated by the 7200s
+    timeouts) and/or the capture-boundary instability seen in no-LoRA EP8.
