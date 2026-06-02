@@ -163,3 +163,25 @@ kernel beats the floor in isolation, THEN one Kimi E2E + accuracy pass.
    torch-bmm dense path. Keep Triton step kernels as multi-LoRA fallback.
 2. Kimi E2E: accuracy (logprob |Δ| within noise) + decode-isolated kv_b time (expect the `_step_*` rows to
    drop ~2.7x). 3. Optional: tune block sizes to close the last ~1.5x to the floor.
+
+## 7. (2026-06-02 23:47) Testbed FIX: CUDA-graph regime (match real profile) — fused win holds
+
+User caught a methodology error: my eager micro-bench (§5/§6) pays full per-kernel launch overhead, but
+real decode runs in a CUDA graph (launch ~0). Eager numbers were ~3x inflated → risk of optimizing
+launch overhead that doesn't exist in serving. Fixed: `bench_kv_b_graph.py` captures each op in a CUDA
+graph and times replay (matches serving). S=64 (real bs=64 per TP rank):
+
+| op (graph replay) | us |
+|---|---|
+| base q full-bmm | 4.12 |
+| base v full-bmm (nvjet floor) | 6.15 |
+| lora q 2-kernel | 10.26 |
+| lora v 2-kernel (step_a_v+step_b_v) | **14.36  ≈ user profile 15us ✓** |
+| lora q FUSED | 6.16  (1.7x) |
+| lora v FUSED | 6.15  (2.3x, == base floor) |
+
+- **Testbed validated**: lora-v 2-kernel 14.36us ≈ the user's profiled 15us. (base v 6.15us vs profiled
+  3.5us — same ballpark; torch.bmm here isn't the exact nvjet absorbed op, but the lora numbers match.)
+- **Fused win is REAL under graph** (not launch overhead): lora-v 14.4→6.2us (2.3x) lands ON the base
+  full-gemm floor; lora-q 10.3→6.2us (1.7x). Combined v+q ~24.6→~12.3us (~2x).
+- LESSON: always bench in the cuda-graph regime for decode kernels; eager overstates and can mislead.
