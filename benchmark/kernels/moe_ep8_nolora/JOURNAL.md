@@ -155,3 +155,18 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
   **step by step** via direct kubectl (more visibility + needed anyway to capture the server-log
   decode throughput). Both pods are already on `a20eb4601` with the rebuilt editable, so the next
   step skips checkout and launches the tp8 no-LoRA server directly.
+
+### 2026-06-02 — EP backend correction (user feedback, PAUSED tp8 mid-load)
+- User flagged the planned EP a2a (`deepep` / low_latency) as **slow and wrong** for this setup, and
+  said: keep the SAME MoE backend as today (the **trtllm-gen** one), do NOT switch to cutlass/cutedsl
+  (neither is fast), and do NOT use deepep — use the same a2a as now.
+- Verified from the live tp8 server_args dump what "today's baseline" actually is:
+  `attention_backend=trtllm_mla`, **`moe_runner_backend=flashinfer_trtllm`** (auto-picked on sm100 for
+  DeepseekV3ForCausalLM), **`moe_a2a_backend=none`**, `ep_size=1`.
+- Confirmed in `server_args.py` (~L2404) that the flashinfer_trtllm auto-selection condition is
+  `quant∈{fp8,fp4} & moe_a2a_backend==none & moe_runner_backend==auto` — it does **NOT** check ep_size.
+  ⇒ adding **only `--ep-size 8`** keeps `flashinfer_trtllm` + `a2a=none`; EP combine rides the existing
+  NVLink TP communicator (no deepep, no NVSHMEM/IBGDA). This is exactly "same backend + same a2a, EP on".
+- **Harness fix:** EP variant flags reduced to `--ep-size 8` (+ optional `--init-expert-location` for
+  the balancedness fallback). Removed the `--moe-runner-backend`/`--moe-a2a-backend`/`--deepep-mode`
+  overrides. EP8 now differs from the tp8 control by exactly one flag.

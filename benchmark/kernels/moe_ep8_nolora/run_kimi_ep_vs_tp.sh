@@ -28,14 +28,15 @@ HEAD_REF=__bench_target          # the commit under test (this branch HEAD)
 # VARIANT=ep8  -> --tp 8 --ep-size 8 with the fp4 EP backends below
 VARIANT="${VARIANT:?set VARIANT=tp8 or VARIANT=ep8}"
 
-# EP8 knobs (only used when VARIANT=ep8). Iterate these on-pod if a launch fails.
-#   MOE_RUNNER:  flashinfer_cutedsl (fp4 only) | flashinfer_cutlass | auto
-#   MOE_A2A:     deepep | flashinfer | none
-#   DEEPEP_MODE: low_latency (decode) | normal | auto
-#   EXPERT_LOC:  trivial (default) | <path/preset>  -> balancedness step (--init-expert-location)
-MOE_RUNNER="${MOE_RUNNER:-flashinfer_cutedsl}"
-MOE_A2A="${MOE_A2A:-deepep}"
-DEEPEP_MODE="${DEEPEP_MODE:-low_latency}"
+# EP8 policy: KEEP the exact same MoE backend + a2a as today's no-LoRA baseline — i.e. do NOT switch
+# the runner to cutlass/cutedsl (neither is fast on this NVFP4/Blackwell path) and do NOT use a deepep
+# a2a (deepep low_latency = NVSHMEM/IBGDA, built for inter-node IB; this is an MNNVL fabric where all
+# 8 GPUs share one NVLink domain, so a deepep dispatch is the slow path). The baseline auto-resolves to
+# moe_runner_backend=flashinfer_trtllm (the "trtllm-gen" MoE) + moe_a2a_backend=none, and that auto
+# selection only checks (quant in {fp8,fp4} & a2a==none & runner==auto) — it does NOT depend on ep_size
+# (server_args.py ~L2404). So adding ONLY `--ep-size 8` keeps flashinfer_trtllm + a2a=none and just
+# turns on EP (each rank owns 384/8=48 experts), with combine over the existing NVLink TP communicator.
+# EXPERT_LOC is the only EP knob, for the balancedness fallback (--init-expert-location).
 EXPERT_LOC="${EXPERT_LOC:-trivial}"
 
 # ===== workload =====
@@ -57,8 +58,8 @@ COMMON="--model-path ${MODEL_PATH} --tp 8 --nnodes 2 --dist-init-addr ${DIST_INI
 --max-prefill-tokens 40960 --chunked-prefill-size 40960"
 
 if [ "${VARIANT}" = ep8 ]; then
-  EP_FLAGS="--ep-size 8 --moe-runner-backend ${MOE_RUNNER} --moe-a2a-backend ${MOE_A2A}"
-  [ "${MOE_A2A}" = deepep ] && EP_FLAGS="${EP_FLAGS} --deepep-mode ${DEEPEP_MODE}"
+  # Only EP on — same flashinfer_trtllm runner + a2a=none as the tp8 control (see policy note above).
+  EP_FLAGS="--ep-size 8"
   [ "${EXPERT_LOC}" != trivial ] && EP_FLAGS="${EP_FLAGS} --init-expert-location ${EXPERT_LOC}"
   COMMON="${COMMON} ${EP_FLAGS}"
 fi
