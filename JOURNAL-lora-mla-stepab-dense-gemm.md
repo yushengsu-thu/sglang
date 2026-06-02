@@ -84,5 +84,41 @@ flag `SGLANG_OPT_MLA_LORA_DENSE_GEMM` (default off).
 4. Decide keep-vs-drop the flag (likely: keep at small bs, fall back to Triton at large bs?); update PR.
    Release pods. (Secondary: MoE shared experts dense gemm — only if the step kernels show a net win.)
 
+## 4. Outcome of the torch-dense wave + pivot (2026-06-02 ~22:30)
+
+- **Accuracy: PASS.** Dense-engaged run vs base: mean|Δlogprob| **0.27365**, p50 0.122 — within the
+  ~0.30 atomic-add noise floor. Dense kv_b correction is numerically correct.
+- **Perf: NOT a win — shelving the torch-bmm dense path.** It lowers to ~12+ tiny kernel launches
+  (transpose/contiguous → bmm → mul → add_, ×4 steps); at decode the launch overhead dominates and
+  eats any saving. E2E numbers were noisy/inconsistent (bs16 +15% / bs64 −4%, base stale). The flag
+  stays default-off; not worth a controlled E2E re-measure.
+
+### New direction (user): single-LoRA *fused* Triton classic gemm
+Hypothesis: the existing `_step_*` kernels are slow because of the **multi-LoRA machinery**
+(weight_indices/lora_ranks lookups, mixed-rank `N_eff` truncation, seg_indptr, permutation gather,
+extra segment grid axis) + being **4 separate kernels** with an HBM round-trip for the rank-dim
+intermediate. For **single LoRA** (`max_loras_per_batch==1`) all of that degenerates to constants/no-ops,
+leaving a plain tiled gemm. Design:
+- **2 fused kernels** (q-correction, v-correction) replacing the 4 step kernels.
+- Each fuses step_a (heavy reduction qk_nope/kv_lora_rank → small rank) + step_b (rank → kv/v_head_dim);
+  keep the `(BLOCK_S, rank≤32)` intermediate in SRAM (no HBM write/read), scaling+accumulate in epilogue.
+- Grid (S-tiles, heads); everything else constexpr; permutation ignored (identity for single slot).
+- Wins: 4→2 launches, no intermediate HBM, zero routing branches, shape-specific tiling.
+- Trade-off: fusing couples A+B so the two-stream A-step/base-bmm overlap is lost — measure fused-no-overlap
+  vs split-with-overlap. Gate on `num_segments==1`, else fall back to current kernels.
+
+### Sanity bound (user): each lora gemm ≥ full-gemm speed
+lora_a `(M,K)@(K,r)` and lora_b `(M,r)@(r,N)` each have FEWER FLOPs than a full `(M,K)@(K,N)` gemm
+(r≪N,K), so **each should be at least as fast as a comparable full gemm**. Any `_step_*` kernel that
+is SLOWER than a full gemm of comparable dims is paying the multi-LoRA tax — that's the target to remove.
+Use full-gemm time as the floor in the micro-bench.
+
+### Iteration plan: micro-bench on the Kimi pod (single GPU), real kernels + real shapes
+Stop iterating via the 2-node Kimi serve (~40-50 min/round). Run a **single-GPU `do_bench` micro-bench
+ON a Kimi pod** using the REAL kv_b kernels + REAL Kimi shapes (H per TP rank, qk_nope=v_head_dim=128,
+kv_lora_rank=512, rank from the alpha adapter), comparing: current 4 `_step_*` kernels vs a full gemm
+of comparable dims (the floor) vs the new fused single-LoRA kernel. Seconds per round. Confirm the
+kernel beats the floor in isolation, THEN one Kimi E2E + accuracy pass.
+
 > Detailed chronological log (incl. every command) lives in
 > `river/task-lora-mla-stepab-dense-gemm/journal.md` (local). This file is the PR-facing summary.
