@@ -29,7 +29,7 @@ _BLOCK_N = 128
 @triton.jit
 def _fused_q_kernel(
     x, B, A, out,
-    S, scaling,
+    S, scaling_ptr,  # 1-elem fp32 tensor (graph-safe: loaded on device, never .item())
     x_s, x_h, x_k,
     b_row, b_r,
     a_r, a_n,
@@ -42,6 +42,7 @@ def _fused_q_kernel(
     s_off = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
     s_mask = s_off < S
     r_off = tl.arange(0, R)
+    scaling = tl.load(scaling_ptr).to(tl.float32)
 
     # --- step A_q: lora_a[BLOCK_S, R] = x[s,h,:] @ B_kc[h]  (contract QK) ---
     acc_a = tl.zeros((BLOCK_S, R), dtype=tl.float32)
@@ -71,7 +72,7 @@ def _fused_q_kernel(
 @triton.jit
 def _fused_v_kernel(
     x, A, B, out,
-    S, scaling,
+    S, scaling_ptr,  # 1-elem fp32 tensor (graph-safe)
     x_s, x_h, x_k,
     a_r, a_k,
     b_row, b_r,
@@ -85,6 +86,7 @@ def _fused_v_kernel(
     s_off = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
     s_mask = s_off < S
     r_off = tl.arange(0, R)
+    scaling = tl.load(scaling_ptr).to(tl.float32)
 
     # --- step A_v: lora_a[BLOCK_S, R] = x[s,h,:] @ A.T  (contract KV) ---
     acc_a = tl.zeros((BLOCK_S, R), dtype=tl.float32)
@@ -111,15 +113,23 @@ def _fused_v_kernel(
         tl.store(op, prev + acc_o.to(out.dtype.element_ty), mask=s_mask[:, None])
 
 
+def _scaling_tensor(scaling, device):
+    """Accept a 1-elem device tensor (graph-safe path) or a python float (tests)."""
+    if torch.is_tensor(scaling):
+        return scaling
+    return torch.tensor([scaling], dtype=torch.float32, device=device)
+
+
 def fused_q_correction(q_nope, B, A, scaling, q_nope_out):
-    """q_nope (S,H,QK); B (H*FULL_K,R); A (R,KV); q_nope_out (S,H,KV) in-place."""
+    """q_nope (S,H,QK); B (H*FULL_K,R); A (R,KV); scaling: 1-elem tensor or float;
+    q_nope_out (S,H,KV) in-place."""
     S, H, QK = q_nope.shape
     R = B.shape[-1]
     KV = A.shape[-1]
     FULL_K = B.shape[0] // H
     grid = (triton.cdiv(S, _BLOCK_S), H)
     _fused_q_kernel[grid](
-        q_nope, B, A, q_nope_out, S, float(scaling),
+        q_nope, B, A, q_nope_out, S, _scaling_tensor(scaling, q_nope.device),
         q_nope.stride(0), q_nope.stride(1), q_nope.stride(2),
         B.stride(0), B.stride(1), A.stride(0), A.stride(1),
         q_nope_out.stride(0), q_nope_out.stride(1), q_nope_out.stride(2),
@@ -136,7 +146,7 @@ def fused_v_correction(attn, A, B, scaling, base_view, qk_nope, v_head_dim):
     FULL_K = B.shape[0] // H
     grid = (triton.cdiv(S, _BLOCK_S), H)
     _fused_v_kernel[grid](
-        attn, A, B, base_view, S, float(scaling),
+        attn, A, B, base_view, S, _scaling_tensor(scaling, attn.device),
         attn.stride(0), attn.stride(1), attn.stride(2),
         A.stride(0), A.stride(1), B.stride(0), B.stride(1),
         base_view.stride(0), base_view.stride(1), base_view.stride(2),

@@ -9,6 +9,7 @@ from sglang.srt.lora.triton_ops.kv_b_lora_single_fused import fused_q_correction
 
 dev, dt = "cuda", torch.bfloat16
 H, QK, V, KV, R, FULL_K, SCALE = 8, 128, 128, 512, 16, 256, 0.3137
+SCL = torch.tensor([SCALE], dtype=torch.float32, device="cuda")
 ms = lambda f: do_bench(f, warmup=50, rep=200) * 1e3
 
 
@@ -35,19 +36,19 @@ def run(S):
 
     # correctness: 2-kernel path vs fused
     o_ref = base_q.clone(); step_b_q_fwd(step_a_q_fwd(q, B, b, FULL_K), A, b, o_ref)
-    o_fus = base_q.clone(); fused_q_correction(q, B[0], A[0], SCALE, o_fus)
+    o_fus = base_q.clone(); fused_q_correction(q, B[0], A[0], SCL, o_fus)
     eq = (o_ref - o_fus).abs().max().item()
     ov_ref = base_v.clone(); step_b_v_fwd(step_a_v_fwd(attn, A, b), B, b, ov_ref, QK, V)
-    ov_fus = base_v.clone(); fused_v_correction(attn, A[0], B[0], SCALE, ov_fus, QK, V)
+    ov_fus = base_v.clone(); fused_v_correction(attn, A[0], B[0], SCL, ov_fus, QK, V)
     ev = (ov_ref - ov_fus).abs().max().item()
 
     # speed — accumulate into a fixed preallocated buffer (no per-iter clone; values drift, timing is clean)
     oq, ov = base_q, base_v
     t_q2 = ms(lambda: step_b_q_fwd(step_a_q_fwd(q, B, b, FULL_K), A, b, oq))
-    t_qf = ms(lambda: fused_q_correction(q, B[0], A[0], SCALE, oq))
+    t_qf = ms(lambda: fused_q_correction(q, B[0], A[0], SCL, oq))
     t_qfull = ms(lambda: torch.bmm(qT, w_kc))
     t_v2 = ms(lambda: step_b_v_fwd(step_a_v_fwd(attn, A, b), B, b, ov, QK, V))
-    t_vf = ms(lambda: fused_v_correction(attn, A[0], B[0], SCALE, ov, QK, V))
+    t_vf = ms(lambda: fused_v_correction(attn, A[0], B[0], SCL, ov, QK, V))
     t_vfull = ms(lambda: torch.bmm(aT, w_vc))
 
     print(f"\n===== S={S} =====   (q correctness maxΔ={eq:.2e}, v correctness maxΔ={ev:.2e})")

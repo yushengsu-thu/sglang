@@ -51,6 +51,7 @@ w_vc = torch.randn(H, KV, V, device=dev, dtype=dt)
 qT, aT = q.transpose(0, 1).contiguous(), attn.transpose(0, 1).contiguous()
 out_q = torch.zeros(S, H, KV, device=dev, dtype=dt)
 out_v = torch.zeros(S, H, V, device=dev, dtype=dt)
+SCL = torch.tensor([SCALE], dtype=torch.float32, device=dev)
 fb_q = torch.zeros(H, S, KV, device=dev, dtype=dt)
 fb_v = torch.zeros(H, S, V, device=dev, dtype=dt)
 
@@ -67,8 +68,8 @@ rows = [
     ("base v full-bmm (attn@w_vc)",   lambda: torch.bmm(aT, w_vc, out=fb_v)),
     ("lora q  2-kernel (a+b)",        lora_q_2k),
     ("lora v  2-kernel (a+b)",        lora_v_2k),
-    ("lora q  FUSED",                 lambda: fused_q_correction(q, B[0], A[0], SCALE, out_q)),
-    ("lora v  FUSED",                 lambda: fused_v_correction(attn, A[0], B[0], SCALE, out_v, QK, V)),
+    ("lora q  FUSED",                 lambda: fused_q_correction(q, B[0], A[0], SCL, out_q)),
+    ("lora v  FUSED",                 lambda: fused_v_correction(attn, A[0], B[0], SCL, out_v, QK, V)),
 ]
 print(f"{'op':34}{'us (graph replay)':>18}")
 for name, fn in rows:
