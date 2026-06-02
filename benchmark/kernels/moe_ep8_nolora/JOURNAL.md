@@ -258,3 +258,23 @@ when it comes up, before drawing any comparison.
 - 23:18: re-running **only the EP8 cell** (`CELLS=variant`, bg `bzdh6ip0r`); its `kill_all` stops the
   still-running base tp8 server, then launches EP8 (warm — autotune cache shared, so READY fast).
   Will verify `--ep-size 8` from the live process, then append the EP8 table + TP8-vs-EP8 delta.
+
+### 2026-06-02 23:25 (KST) — CURRENT STATUS & NEXT STEP
+**Verified (live process + server_args), both launch commands** — identical except EP8 adds `--ep-size 8`:
+- TP8 (base): resolved `tp_size=8, ep_size=1, moe_a2a_backend='none', moe_runner_backend='flashinfer_trtllm'`.
+- EP8 (variant): live cmdline has `--ep-size 8`; resolved `ep_size=8, moe_a2a_backend='none',
+  moe_runner_backend='flashinfer_trtllm'` ✓ (ranks now log `TP0 EP0 … TP7 EP7` → EP active, 48 experts/rank).
+  Same trtllm-gen MoE backend + a2a=none as TP8 — NOT cutlass/cutedsl, NOT deepep.
+
+**Current status:**
+- BASE (TP8) complete: acc + bench bs16..256 captured (table above). 8 graph-on traces pulled.
+- EP8 cell running (`bzdh6ip0r`): loaded OK, now in its own cold `fp4_gemm` autotune (0/20 — the EP
+  layout changes the grouped-GEMM shapes so it re-tunes; ~15-20 min). Not READY yet → no EP8 numbers yet.
+
+**Next step (auto, once EP8 bench lands):**
+1. Build the TP8-vs-EP8 table: per bs {16,32,64,128,256} server-log decode thpt + bench e2e, and the
+   EP8/TP8 ratio — answering "is EP8 OK at larger bs?".
+2. acc: EP8 vs TP8 logprob diff vs the ~0.30 noise floor (numerically-equivalent regression check).
+3. Per user: **graph-off can be skipped** (no new kernels). **init-expert-location is not required** —
+   only attempt the balancedness fallback (or drop to 4 GPU) if EP8 is clearly bad AND imbalance-bound.
+4. Post the comparison to PR #18 description; append results here.
