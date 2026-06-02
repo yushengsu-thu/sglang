@@ -146,6 +146,9 @@ def expand(
     mul_routed_weight=True,
     fuse_sum_all_reduce=True,
     force_block_n=None,
+    use_nloop=False,
+    num_stages=None,
+    load_b_trans=False,
 ):
     sorted_token_ids, expert_ids, num_tokens_post_padded = routing
     lora_b_virtual = lora_b.reshape(lora_b.shape[0] * lora_b.shape[1], *lora_b.shape[2:])
@@ -179,6 +182,9 @@ def expand(
         mul_routed_weight,
         fuse_sum_all_reduce,
         force_block_size_n=force_block_n,
+        use_nloop=use_nloop,
+        num_stages=num_stages,
+        load_b_trans=load_b_trans,
     )
     return output
 
@@ -263,6 +269,14 @@ def main():
     ap.add_argument("--num-warps", type=int, default=4)
     ap.add_argument("--iters", type=int, default=2)
     ap.add_argument("--tol", type=float, default=5e-2)
+    # C1: N-loop kernel (one program per m-block, loops over N-tiles) so num_stages>1 pipelines
+    # the LoRA-B weight load. --nloop selects it; --num-stages sets num_stages (default: launcher
+    # auto -> 3 for nloop, 1 for the per-tile kernel).
+    ap.add_argument("--nloop", action="store_true", help="use the N-loop expand kernel")
+    ap.add_argument("--num-stages", type=int, default=None, help="num_stages for the kernel launch")
+    # C5: load the weight tile as [BLOCK_N, BLOCK_R] (contiguous R last) + transpose for the dot,
+    # instead of the default [BLOCK_R, BLOCK_N] strided load.
+    ap.add_argument("--load-b-trans", action="store_true", help="coalesced transposed B load")
     args = ap.parse_args()
 
     # qwen35: tp4/ep4 -> 64 local experts, N=2048. kimi-k25: TP8/no-EP -> 384 experts, N=7168.
@@ -290,6 +304,7 @@ def main():
         )
         block_ns = [bn for bn in [64, 128, 256, 512] if args.n % bn == 0]
         best = None
+        # Per-tile kernel (baseline): block_m x block_n x group_m x num_warps.
         for block_m in [16, 32, 64]:
             routing = build_v1_routing(topk_ids, tlm, args.num_experts, block_m)
             for block_n in block_ns:
@@ -303,7 +318,26 @@ def main():
                             us = bench_ms(f, warmup=15, rep=60) * 1000
                         except Exception:
                             continue
-                        tag = f"block_m={block_m} block_n={block_n} group_m={group_m} warps={nw}"
+                        tag = f"per-tile block_m={block_m} block_n={block_n} group_m={group_m} warps={nw}"
+                        if best is None or us < best[0]:
+                            best = (us, tag)
+                        print(f"  {us:7.2f} us  {tag}")
+        # C1 N-loop kernel: block_m x block_n x num_warps x num_stages (group_m unused — one
+        # program per m-block streams its expert's whole N row, no cross-program B reuse).
+        for block_m in [16, 32, 64]:
+            routing = build_v1_routing(topk_ids, tlm, args.num_experts, block_m)
+            for block_n in block_ns:
+                for nw in [2, 4, 8]:
+                    for ns in [2, 3, 4]:
+                        f = lambda bm=block_m, bn=block_n, w=nw, s=ns, r=routing: expand(
+                            inter, lora_b, topk_ids, tkw, r, bm,
+                            num_warps=w, force_block_n=bn, use_nloop=True, num_stages=s,
+                        )
+                        try:
+                            us = bench_ms(f, warmup=15, rep=60) * 1000
+                        except Exception:
+                            continue
+                        tag = f"NLOOP block_m={block_m} block_n={block_n} warps={nw} stages={ns}"
                         if best is None or us < best[0]:
                             best = (us, tag)
                         print(f"  {us:7.2f} us  {tag}")
@@ -329,6 +363,7 @@ def main():
     fn = lambda: expand(
         inter, lora_b, topk_ids, tkw, routing, eff_block_m,
         group_m=eff_group_m, num_warps=eff_warps, force_block_n=eff_force_block_n,
+        use_nloop=args.nloop, num_stages=args.num_stages, load_b_trans=args.load_b_trans,
     )
 
     if args.mode == "correctness":
@@ -354,6 +389,8 @@ def main():
                     inter_b, lb, tk, tkw_b, routing_bm, bm,
                     group_m=args.group_m, num_warps=args.num_warps,
                     force_block_n=args.block_n,
+                    use_nloop=args.nloop, num_stages=args.num_stages,
+                    load_b_trans=args.load_b_trans,
                 ).float()
                 err = float((out - ref).abs().max().item())
                 rel = err / float(ref.abs().max().item() + 1e-9)

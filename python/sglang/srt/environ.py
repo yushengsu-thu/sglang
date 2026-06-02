@@ -435,6 +435,22 @@ class Envs:
     # concurrently into a separate buffer; the main stream adds it after the op (all-reduce structure
     # unchanged). Default off until perf-measured + accuracy-validated.
     SGLANG_LORA_OVERLAP_DOWN = EnvBool(False)
+    # Rank-specialized LoRA-B expand-add (_moe_lora_expand_add_kernel): use the N-loop kernel
+    # variant — one program per token/m-block that loops over all N-tiles for its expert, so
+    # Triton can software-pipeline the dominant LoRA-B weight load (prefetch the next N-tile while
+    # computing the current). The default per-tile kernel has no loop (num_stages=1) so the K=16
+    # single-MMA load latency is not hidden; the N-loop kernel pairs with num_stages>1. Down-proj
+    # expand is memory-bound on weight streaming, so this targets bandwidth efficiency. Default off
+    # until perf-measured + accuracy-validated.
+    SGLANG_LORA_EXPAND_NLOOP = EnvBool(False)
+    # num_stages for the LoRA-B expand-add launch. None = auto (3 when the N-loop kernel is on so its
+    # B loads pipeline; 1 for the default per-tile kernel, which has no loop to pipeline).
+    SGLANG_LORA_EXPAND_NUM_STAGES = EnvInt(None)
+    # Rank-specialized LoRA-B expand-add: load each weight tile in its natural [BLOCK_N, BLOCK_R]
+    # orientation (the contiguous R axis is the load's last dim -> fully coalesced) and transpose
+    # for the [R, N] dot operand, instead of the default [R, BLOCK_N] load that leaves the strided
+    # N axis (stride==R) inner. Default off until perf-measured + accuracy-validated.
+    SGLANG_LORA_EXPAND_LOAD_B_TRANS = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

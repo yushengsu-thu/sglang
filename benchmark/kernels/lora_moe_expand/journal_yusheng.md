@@ -101,4 +101,84 @@ bf16 atomic-add, tol 5e-2 abs; max_abs_err 2.4e-3–3.2e-3). My kernel changes m
 > deltas from C1–C4) will be appended below as they complete.
 
 ## Runs
-(to be filled as nodes run)
+
+### Node
+- Pod `sglang-expand-opt-yushengsu-20260602-210212` (id `yushengsu-20260602-210212`),
+  1× **NVIDIA GB200**, image `lmsysorg/sglang:dev-cu13`, node `np-67167b3f-3`. Overlaid the
+  branch `python/sglang` tree + testbed onto the editable install (pure triton kernel, no
+  model weights).
+
+### Baseline reproduced (2026-06-02) — matches PR #12 docs ✓
+Correctness: **12/12 PASS** (kimi + qwen, block_m{16,32,64}×bs{16,64}, tol 5e-2;
+max_abs_err 2.4e-3–3.2e-3).
+
+| shape | config | µs (mine) | doc |
+|---|---|---|---|
+| kimi | production (bm16, bn128, w4) | **27.09** | 27.1 |
+| kimi | manual bm16 **bn512** w4 | **20.14** | 20.1 |
+| kimi | manual bm16 bn128 w4 | 27.48 | — |
+| qwen | production (bm16, bn128, w4) | **6.48** | 6.49 |
+| qwen | manual bm16 **bn512** w4 | **8.92** (WORSE) | — |
+
+**Note:** block_n=512 helps Kimi (large N=7168: 27→20µs) but *hurts* qwen (small N=2048:
+6.48→8.92µs). The block-n win is shape-dependent → any default change must be N-gated.
+
+### C1 — N-loop kernel + num_stages pipelining — ❌ LOSS (rejected)
+Implemented `_moe_lora_expand_add_nloop_kernel` (one program per m-block, inner N-loop,
+`num_stages>1` pipelines the B weight load) + env gate `SGLANG_LORA_EXPAND_NLOOP`.
+Correctness **12/12 PASS**. Perf (block_m=16, GB200, bs=64):
+
+| shape | block_n | stages 2/3/4 (µs) | baseline best |
+|---|---|---|---|
+| kimi | 128 | 73.6 / 62.4 / 62.2 | 27.1 |
+| kimi | 256 | 63.1 / 55.0 / 55.0 | 21.4 |
+| kimi | 512 | 44.4 / 42.4 / 43.0 | **20.1** |
+| qwen | 64 | 38.8 / 34.8 / 34.9 | 6.48 |
+
+**~2–3× SLOWER.** Collapsing the N grid into a per-program loop drops the program count
+from thousands of tiny tiles to ~E_hit (~284), killing the occupancy that was hiding HBM
+latency. The kernel relies on **massive tiny-tile parallelism**, not in-program software
+pipelining. Lesson: for this op, more programs > pipelined loops. Kernel kept env-gated OFF.
+
+### Diagnostic — atomic-add / routed-weight tax
+`fuse_sum_all_reduce + mul_routed_weight` (production) vs plain store (no rw):
+
+| shape | bn | atomic+rw | plain store | tax |
+|---|---|---|---|---|
+| kimi | 512 | 20.13 | **17.34** | 2.80 (14%) |
+| kimi | 128 | 27.16 | 25.01 | 2.14 |
+| qwen | 128 | 6.48 | 4.79 | 1.69 (26%) |
+
+Even **pure weight-streaming** is 17.3µs @ kimi bn512 (~48% of the 8.4µs HBM floor) — the
+weight read dominates. The atomic+rw tax (~2.8µs) is **mandatory semantics** (the kernel's
+all-reduce + routing-weight scale) → not removable. So the streaming itself is the wall.
+
+### C5 — coalesced transposed-B load — ❌ NO WIN (rejected)
+Load each weight tile as `[BLOCK_N, BLOCK_R]` (contiguous R last → coalesced) + `tl.trans`
+for the dot, vs the default `[BLOCK_R, BLOCK_N]` strided load. Env gate
+`SGLANG_LORA_EXPAND_LOAD_B_TRANS`. Correctness **12/12 PASS**. Perf:
+
+| shape | bn | trans | baseline |
+|---|---|---|---|
+| kimi | 128 | 26.3 | 27.1 |
+| kimi | 256 | 21.9 | 21.4 |
+| kimi | 512 | **23.6** | **20.1** |
+| qwen | 128 | 6.46 | 6.48 |
+
+Worse at the best config (bn512). The `tl.trans` shared-memory roundtrip outweighs the
+coalescing gain; Triton already vectorizes the contiguous R=16 (32-byte) inner run of the
+default load. Kept env-gated OFF.
+
+## Conclusion (kernel optimization)
+The expand-add is **memory-bound on LoRA-B weight streaming** and the per-tile kernel is
+already near its practical floor. Two kernel-structure ideas from the theoretical analysis
+(latency-hiding via N-loop pipelining; better coalescing via transposed load) were
+implemented + measured and **neither beats the baseline** — the op is occupancy-bound on
+tiny tiles, and pure streaming is already 17.3µs (~48% HBM peak). **The only validated lever
+is `BLOCK_SIZE_N=512` for large-N (Kimi, N=7168): 27.1→20.1µs (~25% / ≈25.1→~20µs e2e).**
+Neutral-to-worse for small-N (qwen N=2048: keep 128). This must be N-gated in the launcher.
+
+> NOTE: this `block_n=512` config lever overlaps the existing `lora-expand-block-n-tune`
+> branch. Surfacing to the user before shipping a duplicate launcher change + burning the
+> full 3-model regression. My added value here: the empirical proof that the kernel-structure
+> rewrites (C1/C5) do NOT help, i.e. block_n=512 is the practical ceiling.
