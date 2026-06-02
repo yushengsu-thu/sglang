@@ -26,6 +26,10 @@ from sglang.srt.lora.triton_ops import (
     step_b_q_fwd,
     step_b_v_fwd,
 )
+from sglang.srt.lora.triton_ops.kv_b_lora_single_fused import (
+    fused_q_correction,
+    fused_v_correction,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.lora.utils import LoRABatchInfo
@@ -33,12 +37,15 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Experimental dense (standard torch bmm/matmul) path, gated by
-# ``SGLANG_OPT_MLA_LORA_DENSE_GEMM``. Replaces the per-head Triton SGMM step
-# kernels with batched dense gemms for the single-active-adapter decode case.
-# The four step kernels are tiny per-head SGMMs (rank ~16-32) and profiling
-# flagged them as a non-overlapped ~45us hotspot; the question is whether a
-# plain bmm (cuBLAS) beats the fused-but-tiny Triton tiles. See journal.
+# Single-LoRA FUSED kv_b correction, gated by ``SGLANG_OPT_MLA_LORA_DENSE_GEMM``.
+# For the single-active-adapter case the multi-LoRA machinery in the 4 step
+# kernels (routing / rank-truncation / permutation / extra grid axis) and the
+# HBM round-trip for the rank-dim intermediate all disappear: each correction
+# collapses to ONE fused Triton kernel (step_a + step_b, rank intermediate kept
+# in SRAM) — see ``triton_ops/kv_b_lora_single_fused.py``. Micro-bench (cuda-graph
+# regime, real Kimi shapes): lora-v 14.4->6.2us (2.7x, == full-gemm floor),
+# lora-q 10.3->6.2us; bit-exact vs the 4 step kernels. Multi-LoRA falls back to
+# the Triton step kernels.
 # ---------------------------------------------------------------------------
 
 
@@ -75,46 +82,6 @@ def _slot_weights(A_buf, B_buf, batch_info):
     B = B_buf.index_select(0, slot).squeeze(0)  # (H*FULL_K, rank)
     scaling = batch_info.scalings.index_select(0, slot)  # (1,) tensor
     return A, B, scaling
-
-
-def _dense_step_a_q(q_nope, B, full_K_per_head):
-    """step A_q as a batched gemm: ``(S,H,qk_nope) -> (H,S,rank)``."""
-    S, H, qk = q_nope.shape
-    rank = B.shape[-1]
-    B_kc = B.view(H, full_K_per_head, rank)[:, :qk, :].contiguous()  # (H,qk,rank)
-    return torch.bmm(q_nope.transpose(0, 1).contiguous(), B_kc)  # (H,S,rank)
-
-
-def _dense_step_b_q(q_lora_a_hsr, A, scaling, q_nope_out):
-    """step B_q: ``q_nope_out (S,H,kv) += (H,S,rank) @ A(rank,kv) * scaling``.
-
-    Keep the matmul operands same-dtype (``A`` and ``q_lora_a`` are bf16); apply
-    the fp32 ``scaling`` to the result and cast back (``bf16 * f32 -> f32`` would
-    otherwise make ``A*scaling`` float and mismatch the bf16 matmul). Scaling in
-    fp32 matches the Triton kernel (fp32 accumulator ``*= scaling`` then cast).
-    """
-    delta = torch.matmul(q_lora_a_hsr, A)  # (H,S,kv) bf16
-    delta = (delta * scaling).to(q_nope_out.dtype)
-    q_nope_out.add_(delta.transpose(0, 1))
-    return q_nope_out
-
-
-def _dense_step_a_v(attn_output, A):
-    """step A_v as a batched gemm: ``(S,H,kv) @ A.T(kv,rank) -> (H,S,rank)``."""
-    return torch.matmul(attn_output.transpose(0, 1).contiguous(), A.t())
-
-
-def _dense_step_b_v(attn_lora_a_hsr, B, scaling, base_view, qk_nope, v_head_dim):
-    """step B_v: ``base (S,H,v) += (H,S,rank) @ B_vc.T(H,rank,v) * scaling``."""
-    H = base_view.shape[1]
-    rank = B.shape[-1]
-    full_K = qk_nope + v_head_dim
-    B_vc = B.view(H, full_K, rank)[:, qk_nope:, :].contiguous()  # (H,v,rank)
-    # same-dtype bmm (B_vc, attn_lora_a are bf16); fp32 scaling applied after + cast back.
-    delta = torch.bmm(attn_lora_a_hsr, B_vc.transpose(1, 2))  # (H,S,v) bf16
-    delta = (delta * scaling).to(base_view.dtype)
-    base_view.add_(delta.transpose(0, 1))
-    return base_view
 
 
 def is_kv_b_lora_active(attn_module: "DeepseekV2AttentionMLA") -> bool:
@@ -168,9 +135,9 @@ def apply_q_correction(
 
     full_K_per_head = attn_module.qk_nope_head_dim + attn_module.v_head_dim
     if _dense_path_active(batch_info):
+        # single-LoRA fused kernel (step_a_q + step_b_q in one launch, rank intermediate in SRAM)
         A, B, scaling = _slot_weights(A_buf, B_buf, batch_info)
-        q_lora_a = _dense_step_a_q(q_nope, B, full_K_per_head)
-        return _dense_step_b_q(q_lora_a, A, scaling, q_nope_out)
+        return fused_q_correction(q_nope, B, A, scaling, q_nope_out)
     q_lora_a = step_a_q_fwd(q_nope, B_buf, batch_info, full_K_per_head)
     return step_b_q_fwd(q_lora_a, A_buf, batch_info, q_nope_out)
 
@@ -196,10 +163,11 @@ def apply_v_correction(
         -1, attn_module.num_local_heads, attn_module.v_head_dim
     )
     if _dense_path_active(batch_info):
+        # single-LoRA fused kernel (step_a_v + step_b_v in one launch, rank intermediate in SRAM)
         A, B, scaling = _slot_weights(A_buf, B_buf, batch_info)
-        attn_lora_a = _dense_step_a_v(attn_output, A)
-        _dense_step_b_v(
-            attn_lora_a,
+        fused_v_correction(
+            attn_output,
+            A,
             B,
             scaling,
             base_view,
@@ -261,10 +229,9 @@ def kv_b_lora_q_prepare(attn_module, q_nope):
     full_K_per_head = attn_module.qk_nope_head_dim + attn_module.v_head_dim
     side_stream.wait_stream(torch.cuda.current_stream())
     if _dense_path_active(batch_info):
-        A, B, scaling = _slot_weights(A_buf, B_buf, batch_info)
-        with torch.cuda.stream(side_stream):
-            q_lora_a = _dense_step_a_q(q_nope, B, full_K_per_head)
-        return "dense_q", q_lora_a, A, scaling, side_stream
+        # fused single-LoRA kernel is monolithic (A and B steps fused) — it can't fork the A-step
+        # onto the side stream, so run it serially in apply via the None-handle fallback.
+        return None
     with torch.cuda.stream(side_stream):
         q_lora_a = step_a_q_fwd(q_nope, B_buf, batch_info, full_K_per_head)
     return q_lora_a, A_buf, batch_info, side_stream
@@ -275,14 +242,11 @@ def kv_b_lora_q_apply(attn_module, q_nope, q_nope_out, handle):
     set, else the serial correction, else a no-op. Single call replacing the
     ``if is_kv_b_lora_active: apply_q_correction`` at the call site."""
     if handle is not None:
-        if isinstance(handle[0], str):  # dense marker
-            _, q_lora_a, A, scaling, side_stream = handle
-            torch.cuda.current_stream().wait_stream(side_stream)
-            return _dense_step_b_q(q_lora_a, A, scaling, q_nope_out)
         q_lora_a, A_buf, batch_info, side_stream = handle
         torch.cuda.current_stream().wait_stream(side_stream)
         return step_b_q_fwd(q_lora_a, A_buf, batch_info, q_nope_out)
     if is_kv_b_lora_active(attn_module):
+        # serial path (also the dense/fused path: prepare returns None for single-LoRA)
         return apply_q_correction(attn_module, q_nope, q_nope_out)
     return q_nope_out
 
@@ -297,10 +261,8 @@ def kv_b_lora_v_prepare(attn_module, attn_output):
     A_buf, B_buf, batch_info, side_stream = st
     side_stream.wait_stream(torch.cuda.current_stream())
     if _dense_path_active(batch_info):
-        A, B, scaling = _slot_weights(A_buf, B_buf, batch_info)
-        with torch.cuda.stream(side_stream):
-            attn_lora_a = _dense_step_a_v(attn_output, A)
-        return "dense_v", attn_lora_a, B, scaling, side_stream
+        # fused single-LoRA kernel is monolithic — run serially in apply (None-handle fallback).
+        return None
     with torch.cuda.stream(side_stream):
         attn_lora_a = step_a_v_fwd(attn_output, A_buf, batch_info)
     return attn_lora_a, B_buf, batch_info, side_stream
@@ -313,18 +275,6 @@ def kv_b_lora_v_apply(attn_module, attn_output, attn_bmm_flat, handle):
         base_view = attn_bmm_flat.view(
             -1, attn_module.num_local_heads, attn_module.v_head_dim
         )
-        if isinstance(handle[0], str):  # dense marker
-            _, attn_lora_a, B, scaling, side_stream = handle
-            torch.cuda.current_stream().wait_stream(side_stream)
-            _dense_step_b_v(
-                attn_lora_a,
-                B,
-                scaling,
-                base_view,
-                attn_module.qk_nope_head_dim,
-                attn_module.v_head_dim,
-            )
-            return attn_bmm_flat
         attn_lora_a, B_buf, batch_info, side_stream = handle
         torch.cuda.current_stream().wait_stream(side_stream)
         step_b_v_fwd(
