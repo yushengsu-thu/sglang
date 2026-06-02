@@ -435,6 +435,11 @@ class Envs:
     # concurrently into a separate buffer; the main stream adds it after the op (all-reduce structure
     # unchanged). Default off until perf-measured + accuracy-validated.
     SGLANG_LORA_OVERLAP_DOWN = EnvBool(False)
+    # Absorbed-MLA kv_b_proj LoRA correction: replace the per-head Triton SGMM step kernels
+    # (step_a/b_q, step_a/b_v in kv_b_lora_absorbed.py) with standard dense torch bmm/matmul.
+    # Only the single-active-adapter decode case (num_segments==1) takes the dense path; all
+    # other shapes fall back to the Triton kernels. Default off until perf-measured + acc-validated.
+    SGLANG_OPT_MLA_LORA_DENSE_GEMM = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
