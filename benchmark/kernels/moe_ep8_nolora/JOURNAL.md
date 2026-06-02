@@ -140,3 +140,10 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
 - Starting **VARIANT=tp8 (control)** via `run_kimi_ep_vs_tp.sh` (driven locally): checkout __bench_target +
   pip install -e, launch no-LoRA server, bench bs 16/32/64/128/256 (in/out 2048), profile graph-on
   bs 16/64/128/256 + graph-off bs16. Running in background.
+- **tp8 run #1 FAILED (exit 1) in `checkout()`.** Root cause: the branch editable rebuild
+  (`pip install -e python`) died with **"can't find Rust compiler"** on the worker pod. The in-pod
+  `setup.sh` had sourced `~/.cargo/env` directly so the base/main install built fine, but our
+  `checkout()` runs pip via `kubectl exec bash -lc`, which does NOT put cargo on PATH. (`set -e` +
+  `both` runs the worker first → it aborted before the head even ran, hence head had no pip.log.)
+  Confirmed cargo present at `/root/.cargo/bin/cargo` (1.96.0); `. ~/.cargo/env` fixes PATH.
+  **Fix:** `checkout()` now sources `~/.cargo/env` before `pip install -e`. Re-running tp8.

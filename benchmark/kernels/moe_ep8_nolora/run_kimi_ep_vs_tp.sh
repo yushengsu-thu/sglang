@@ -69,7 +69,10 @@ kh(){ kubectl exec "${HEAD_POD}"   -- bash -lc "$1"; }
 kw(){ kubectl exec "${WORKER_POD}" -- bash -lc "$1"; }
 both(){ kw "$1"; kh "$1"; }
 kill_all(){ both 'pkill -f "[s]glang.launch_server" >/dev/null 2>&1 || true; pkill -f "[b]ench_one_batch_server" >/dev/null 2>&1 || true; sleep 8'; }
-checkout(){ both "cd /root/sglang; git cat-file -e $1^{commit} 2>/dev/null || git fetch origin main; git checkout -q --detach $1; pip install -e python >/tmp/pip.log 2>&1"; kh "cd /root/sglang && git --no-pager log -1 --oneline"; }
+# NOTE: source ~/.cargo/env before pip install — the editable build needs the Rust compiler, which
+# the in-pod setup.sh sourced directly but `kubectl exec bash -lc` does not put on PATH (=> the
+# branch rebuild fails with "can't find Rust compiler" even though the base/main install succeeded).
+checkout(){ both "cd /root/sglang; git cat-file -e $1^{commit} 2>/dev/null || git fetch origin main; git checkout -q --detach $1; . \$HOME/.cargo/env 2>/dev/null || true; pip install -e python >/tmp/pip.log 2>&1"; kh "cd /root/sglang && git --no-pager log -1 --oneline"; }
 prewarm(){ for P in "${WORKER_POD}" "${HEAD_POD}"; do kubectl exec "${P}" -- bash -lc 'python3 -c "from transformers import AutoConfig, AutoTokenizer, AutoProcessor; m=\"/root/Kimi-K2.5-NVFP4\"; AutoConfig.from_pretrained(m, trust_remote_code=True); AutoTokenizer.from_pretrained(m, trust_remote_code=True); AutoProcessor.from_pretrained(m, trust_remote_code=True); print(\"prewarmed\")"'; done; }
 
 start_rank(){  # $1=pod $2=node-rank $3=extra-flags
