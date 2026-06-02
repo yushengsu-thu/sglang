@@ -56,6 +56,8 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
 
 ## Conventions
 
+- **Journal timestamps (REQUIRED):** every log entry/heading must carry **date AND time** (HH:MM, with
+  tz), not just the date — e.g. `### 2026-06-02 22:46 (KST) — …`.
 - **Perf measurement rule (REQUIRED):** never read only the `bench_one_batch_server` e2e result.
   Also read the **decode throughput (token/s) printed in the server log** (`/tmp/server.log`:
   `Decode batch ... gen throughput (token/s): ...`) and report that per bs/variant. The e2e number
@@ -189,3 +191,10 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
   the ~0.30 noise floor. summary.py (ACC_TOL=0.30) + decode_isolate.py run locally after.
 - DECODE-THPT-RULE (skill §304) reaffirms: report server-log decode thpt, not just bench e2e.
 - Next: run `run_kimi_epreg.sh` in background (its kill_all clears my orphaned tp8 launcher first).
+
+### 2026-06-02 22:46 (KST) — hardened run launched & clean
+- Launched `run_kimi_epreg.sh` (bg `b9vrh0lkk`), `RUN_ROOT=~/Downloads/sglang_kimi_epreg_${ID}`.
+- Clean start confirmed: both pods `prewarmed`, entered `CELL base`, and **GPU compute-apps == 0 on
+  both nodes** — the skill's `kill_all` reaped my earlier orphaned tp8 launcher (robustness #1 worked).
+- base cell now in checkout (pip install + cargo fix) → base graph-ON launch → ~20min cold fp4 autotune.
+- (Reminder applied from here on: every journal entry carries date + time.)
