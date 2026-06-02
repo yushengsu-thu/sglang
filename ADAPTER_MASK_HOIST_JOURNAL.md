@@ -1,7 +1,7 @@
 # adapter_enabled mask-hoist — task journal (DID / NOW / NEXT)
 
 Branch: `lora-adapter-mask-hoist` @ `2c6adb4e` (base `lora-opti-nvfp4` @ `ac0fa6d3`). PR: jybsuper/sglang#15.
-Last updated: 2026-06-02 ~22:02 (local).
+Last updated: 2026-06-02 22:47 (local).
 
 ---
 
@@ -66,10 +66,22 @@ scatter path), incl. the persistent cuda-graph buffer. So `adapter_enabled[i]==1
 
 → numerically a no-op; removes real per-layer overhead (bigger win on 35B with more MoE layers).
 
-### Kimi-K2.5-NVFP4 — IN PROGRESS, no numbers yet
-On dev-cu13, 2-node tp8, both cells LoRA-on trtllm + virtual-experts (+ two-stream envs), differ only
-by commit. As of 22:02: model loaded (NVFP4, ~72GB/GPU ×8), **CUDA-graph capture + cold fp4_gemm
-autotune** running (the ~20-min frozen-log phase). No acc/bench captured yet.
+### Kimi-K2.5-NVFP4 — DONE (2026-06-02 22:44) on dev-cu13, 2-node tp8
+Both cells LoRA-on trtllm + virtual-experts (+ two-stream envs), differ only by commit.
+- **Accuracy** (variant vs base, 1808 tok): mean|Δlogprob| = **0.2873**, max 4.24. Kimi's atomic-add
+  noise floor is ~0.26–0.30 (documented) → within noise → **no regression / no-op**.
+- **Decode throughput** (server-log `gen throughput (token/s)`, median; NOT e2e):
+  | bs | base | variant | Δ% |
+  |----|------|---------|-----|
+  | 16 | 675.5 | 660.9 | −2.2% |
+  | 32 | 1213.6 | 1229.0 | +1.3% |
+  | 64 | 2098.5 | 2085.1 | −0.6% |
+  → ±1–2% mixed-sign = run-to-run noise → no meaningful change, no regression. Expected: Kimi decode is
+  dominated by heavy NVFP4 MoE compute, so the removed mask kernels are negligible (unlike Qwen's +3.5–10%).
+- Notes (2026-06-02): run1 crashed on a run_kimi.sh bash bug (`local cell=$1 ... ${cell}` same-line
+  expand under set -u) during profiling → fixed + ran acc+bench only (profiling skipped). Also fixed a
+  cross-session pkill collision (in-pod /root/_rank.sh launcher). e2e bench (ref): base bs16 49.98s/676,
+  variant bs16 51.21s/659 — e2e mixes prefill+decode so decode-tput above is the right perf signal.
 
 ## 4. CURRENT STATE (live)
 - ID `yushengsu-20260602-161645`, ctx `leira`. Pods `mnnvl-kimi-...-0` (np-18) + `-1` (np-4), Running,
@@ -79,10 +91,11 @@ autotune** running (the ~20-min frozen-log phase). No acc/bench captured yet.
 - Cordoned by me (restore at cleanup): `np-20` (small disk). `np-13` was pre-cordoned by others — leave.
 
 ## 5. NEXT
-- [ ] Let Kimi finish; compute Kimi acc-diff vs base-vs-base noise floor + perf delta (prefill/decode
-      split) + decode-isolated profile; add to PR #15.
+- [x] Kimi acc + decode-throughput done (2026-06-02 22:44) — no-op, no regression (above).
+- [ ] (optional, rigor) measure Kimi base-vs-base acc noise floor to confirm 0.2873 is noise (relaunch
+      base, 2 acc passes); documented floor 0.26–0.30 + ±2% decode already support no-op.
+- [ ] (optional) decode-isolated profiler traces (re-enable prof/pull_traces in run_kimi.sh, now bug-fixed).
 - [ ] Final cleanup: `kubectl uncordon np-67167b3f-20...`; release Kimi pods + ComputeDomain + head svc.
-- [ ] (optional) tune GB200 MoE config to drop the "Using default MoE kernel config" warning.
 
 ## 6. HOW TO RESUME (if this session is lost)
 ```
