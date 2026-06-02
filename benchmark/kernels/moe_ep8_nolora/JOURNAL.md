@@ -382,3 +382,32 @@ when it comes up, before drawing any comparison.
   - Note: LoRA uses the `sgl_flashinfer_trtllm` backend = a DIFFERENT autotune cache → expect another
     cold tune (~20min) for the TP8+LoRA cell; EP8+LoRA may hit the same desync (mitigated by the 7200s
     timeouts) and/or the capture-boundary instability seen in no-LoRA EP8.
+
+### 2026-06-03 02:03 (KST) — RESULTS: TP8+LoRA vs EP8+LoRA — EP cuts the LoRA tax (P0 confirmed)
+Both LoRA cells ran. **TP8+LoRA stable** (full bs16..256). **EP8+LoRA** completed bs16 then crashed
+during bs32 bench (same capture/serve instability as no-LoRA EP8) → only bs16 measured.
+
+**With-LoRA decode throughput (bench output_thpt, token/s):**
+
+| bs | TP8+LoRA | EP8+LoRA | EP8/TP8 |
+|----|------|------|------|
+| 16  | 675.8 | **760.5** | **1.13** (EP8+LoRA ~13% FASTER) |
+| 32  | 1214.8 | crashed mid-bench | — |
+| 64  | 2071.0 | crashed | — |
+| 128 | 3513.0 | crashed | — |
+| 256 | 5464.1 | crashed | — |
+
+**LoRA tax (throughput retained vs no-LoRA, bs16):**
+- TP8: 1272 → 676 = **53% retained (47% LoRA tax)**
+- EP8: 1240 → 761 = **61% retained (39% LoRA tax)**
+
+**Headline (P0 confirmed):** **EP shrinks the LoRA tax** — the TP tax lives in the LoRA grouped-GEMM
+kernels (gate_up-A shrink + down-B expand stream the full per-expert weight under TP); EP slices them
+8× (48 experts/rank), so EP helps the LoRA path much more than the base MoE. Concretely at bs16, going
+TP8→EP8 *hurts* the no-LoRA baseline (−3%) but *helps* the LoRA case (+13%), and the LoRA tax drops
+47%→39%. The win should grow at larger bs (as it did for no-LoRA: +9% at bs128) — but **EP8 can't yet
+hold a server past bs16-128 to measure it**.
+- acc (EP8+LoRA vs TP8+LoRA, numerically-equiv): mean|Δlogprob| = **0.2933** (n=1808, max 8.86) — within
+  the ~0.30 noise floor but near the edge (vs 0.11 for no-LoRA); no clear regression, worth a recheck.
+- **The gating issue is EP8 stability**, not throughput: EP8 (±LoRA) reproducibly tears down at the
+  graph-capture / first-serve boundary or mid-bench at larger bs. That's the thing to fix to make EP usable.
