@@ -1,5 +1,11 @@
 # Task (tom): Kimi-K2.5 down-proj LoRA-B expand-add — shapes + BLOCK_SIZE_N tuning, e2e-validated
 
+> **This file is the single source of truth for the PR** (jybsuper/sglang **#12**,
+> `fzyzcjy:tom/lora-moe-expand-down-bench` → `nvfp4-lora`). The PR description is intentionally
+> empty — read this journal. The PR is **stacked on #11**: until #11 merges, the PR diff also
+> shows #11's `bench_expand_add_down.py` + UT + `JOURNAL.md`; the net-new commits are the three
+> listed under "What changed".
+
 Follow-up to PR #11 (`bench_expand_add_down.py`), which scoped the down-proj expand-add to
 **qwen3.5-35b** (64 local experts, N=2048). This:
 1. Adds the **Kimi-K2.5** shape (`--model kimi-k25`).
