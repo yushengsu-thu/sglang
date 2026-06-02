@@ -49,41 +49,36 @@ scatter path), incl. the persistent cuda-graph buffer. So `adapter_enabled[i]==1
 
 ## 3. RESULTS SO FAR
 
-### Qwen — PASS on both models (acc within noise floor; perf faster)
-Accuracy measured at **bs=1** (single-sequence per-token logprob capture):
-| Model | tokens (bs=1) | variant-vs-base mean\|Δlogprob\| | noise floor (base-vs-base) | acc verdict |
-|-------|---------------|---------------------------------|----------------------------|-------------|
-| Qwen3-VL-30B-A3B-FP8 | 1820 | 0.0556 (max 1.59) | 0.0581 | within noise → no regression |
-| Qwen3.5-35B-A3B-FP8  | 31999 | 0.0242 (max 2.06) | 0.0227 | within noise → no regression |
+All 3 models: variant vs base, both cells LoRA-on trtllm-LoRA + virtual-experts, differ only by this commit.
 
-Perf — bench e2e, in/out 2048/2048, per batch size:
-| Model | bs | base lat | variant lat | base out tok/s | variant out tok/s |
-|-------|----|----------|-------------|----------------|-------------------|
-| Qwen3-VL | 16 | 15.63s | 15.06s (−3.6%) | 2142 | 2226 (+3.9%) |
-| Qwen3-VL | 32 | 17.46s | 16.83s | 3891 | 4041 |
-| Qwen3-VL | 64 | 19.96s | 19.27s | 6983 | 7246 |
-| Qwen3.5  | 16 | 16.37s | 14.79s (−9.7%) | 2201 | 2439 (+10.8%) |
-| Qwen3.5  | 32 | 18.64s | 17.55s | 4137 | 4416 |
-| Qwen3.5  | 64 | 22.97s | 22.14s | 7493 | 7875 |
+**Accuracy — bs=1** (single-sequence per-token logprob capture). MoE LoRA uses atomic-add → run-to-run
+nondeterminism, so judged vs a base-vs-base noise floor:
+| Model | tokens (bs=1) | mean\|Δlogprob\| | noise floor | verdict |
+|-------|---------------|------------------|-------------|---------|
+| Qwen3-VL-30B-A3B-FP8 | 1820 | 0.0556 | 0.0581 (measured) | within noise |
+| Qwen3.5-35B-A3B-FP8  | 31999 | 0.0242 | 0.0227 (measured) | within noise |
+| Kimi-K2.5-NVFP4      | 1808 | 0.2873 | ~0.26–0.30 (documented) | within noise |
 
-→ numerically a no-op; removes real per-layer overhead (bigger win on 35B with more MoE layers).
+**Performance — output throughput (tok/s), one table** (in/out 2048/2048). Qwen rows = bench e2e out-tput;
+Kimi rows = server-log decode throughput (median gen tok/s):
+| Model | bs | base tok/s | variant tok/s | Δ% | metric |
+|-------|----|-----------|---------------|-----|--------|
+| Qwen3-VL-30B-A3B-FP8 | 16 | 2142 | 2226 | +3.9% | e2e out |
+| Qwen3-VL-30B-A3B-FP8 | 32 | 3891 | 4041 | +3.9% | e2e out |
+| Qwen3-VL-30B-A3B-FP8 | 64 | 6983 | 7246 | +3.8% | e2e out |
+| Qwen3.5-35B-A3B-FP8  | 16 | 2201 | 2439 | +10.8% | e2e out |
+| Qwen3.5-35B-A3B-FP8  | 32 | 4137 | 4416 | +6.7% | e2e out |
+| Qwen3.5-35B-A3B-FP8  | 64 | 7493 | 7875 | +5.1% | e2e out |
+| Kimi-K2.5-NVFP4      | 16 | 675.5 | 660.9 | −2.2% | decode |
+| Kimi-K2.5-NVFP4      | 32 | 1213.6 | 1229.0 | +1.3% | decode |
+| Kimi-K2.5-NVFP4      | 64 | 2098.5 | 2085.1 | −0.6% | decode |
 
-### Kimi-K2.5-NVFP4 — DONE (2026-06-02 22:44) on dev-cu13, 2-node tp8
-Both cells LoRA-on trtllm + virtual-experts (+ two-stream envs), differ only by commit.
-- **Accuracy** at **bs=1** (variant vs base, 1808 tok): mean|Δlogprob| = **0.2873**, max 4.24. Kimi's
-  atomic-add noise floor is ~0.26–0.30 (documented) → within noise → **no regression / no-op**.
-- **Decode throughput** (server-log `gen throughput (token/s)`, median; NOT e2e), per batch size:
-  | bs | base | variant | Δ% |
-  |----|------|---------|-----|
-  | 16 | 675.5 | 660.9 | −2.2% |
-  | 32 | 1213.6 | 1229.0 | +1.3% |
-  | 64 | 2098.5 | 2085.1 | −0.6% |
-  → ±1–2% mixed-sign = run-to-run noise → no meaningful change, no regression. Expected: Kimi decode is
-  dominated by heavy NVFP4 MoE compute, so the removed mask kernels are negligible (unlike Qwen's +3.5–10%).
-- Notes (2026-06-02): run1 crashed on a run_kimi.sh bash bug (`local cell=$1 ... ${cell}` same-line
-  expand under set -u) during profiling → fixed + ran acc+bench only (profiling skipped). Also fixed a
-  cross-session pkill collision (in-pod /root/_rank.sh launcher). e2e bench (ref): base bs16 49.98s/676,
-  variant bs16 51.21s/659 — e2e mixes prefill+decode so decode-tput above is the right perf signal.
+→ no-op (acc within noise everywhere); faster on Qwen FP8; flat within noise on Kimi NVFP4 (decode
+dominated by fp4 MoE compute → removed mask kernels negligible). No regression on any model.
+
+Kimi run notes (2026-06-02 22:44): run1 crashed on a run_kimi.sh bash bug (`local cell=$1 … ${cell}`
+same-line expand under set -u) during profiling → fixed + ran acc+bench only. Also fixed a cross-session
+pkill collision (in-pod /root/_rank.sh launcher). Kimi e2e ref: base bs16 49.98s/676, variant 51.21s/659.
 
 ## 4. CURRENT STATE (live)
 - ID `yushengsu-20260602-161645`, ctx `leira`. Pods `mnnvl-kimi-...-0` (np-18) + `-1` (np-4), Running,
