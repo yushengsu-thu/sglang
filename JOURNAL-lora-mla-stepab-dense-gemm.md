@@ -84,7 +84,7 @@ flag `SGLANG_OPT_MLA_LORA_DENSE_GEMM` (default off).
 4. Decide keep-vs-drop the flag (likely: keep at small bs, fall back to Triton at large bs?); update PR.
    Release pods. (Secondary: MoE shared experts dense gemm — only if the step kernels show a net win.)
 
-## 4. Outcome of the torch-dense wave + pivot (2026-06-02 ~22:30)
+## 4. Outcome of the torch-dense wave + pivot (2026-06-02 22:30)
 
 - **Accuracy: PASS.** Dense-engaged run vs base: mean|Δlogprob| **0.27365**, p50 0.122 — within the
   ~0.30 atomic-add noise floor. Dense kv_b correction is numerically correct.
@@ -123,7 +123,7 @@ kernel beats the floor in isolation, THEN one Kimi E2E + accuracy pass.
 > Detailed chronological log (incl. every command) lives in
 > `river/task-lora-mla-stepab-dense-gemm/journal.md` (local). This file is the PR-facing summary.
 
-## 5. Micro-bench result (on Kimi pod, single GB200, real shapes) — hypothesis CONFIRMED
+## 5. (2026-06-02 22:40) Micro-bench result (on Kimi pod, single GB200, real shapes) — hypothesis CONFIRMED
 
 `bench_kv_b_kernels.py`, per-layer decode, H=8/qk=128/kv=512/rank=16:
 
@@ -142,7 +142,7 @@ kernel beats the floor in isolation, THEN one Kimi E2E + accuracy pass.
 - **Target:** get step_a_q/step_a_v to the full-gemm floor (~11µs) and fuse 4 steps → 2; aim 64-80µs → ~25-40µs.
 - Iteration loop is now seconds (this bench on 1 GPU), not a 40-min serve.
 
-## 6. FUSED single-LoRA kernel — WORKS (bit-exact, ~2.7x, near floor)
+## 6. (2026-06-02 22:46) FUSED single-LoRA kernel — WORKS (bit-exact, ~2.7x, near floor)
 
 `bench_kv_b_fused.py` (single GB200, real shapes, accumulate into fixed buffer / no clone):
 
