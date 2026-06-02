@@ -141,3 +141,25 @@ kernel beats the floor in isolation, THEN one Kimi E2E + accuracy pass.
   full-bmm ~11-13µs is the right floor.)
 - **Target:** get step_a_q/step_a_v to the full-gemm floor (~11µs) and fuse 4 steps → 2; aim 64-80µs → ~25-40µs.
 - Iteration loop is now seconds (this bench on 1 GPU), not a 40-min serve.
+
+## 6. FUSED single-LoRA kernel — WORKS (bit-exact, ~2.7x, near floor)
+
+`bench_kv_b_fused.py` (single GB200, real shapes, accumulate into fixed buffer / no clone):
+
+| correction | 2-kernel us (S=16/32/64) | FUSED us | full-gemm floor us | speedup |
+|---|---|---|---|---|
+| q | 46.8 / 45.0 / 42.1 | 17.5 / 17.6 / 15.6 | ~11 | ~2.6x |
+| v | 42.8 / 45.7 / 47.1 | 17.1 / 17.3 / 16.0 | ~9-11 | 2.5-3x |
+| TOTAL | 89.6 / 90.6 / 89.2 | 34.6 / 34.9 / 31.6 | ~20-30 | ~2.7x |
+
+- **Bit-exact** vs the 2-kernel path (correctness maxΔ = 0.00e+00 for q and v).
+- **~2.7x faster** than the current Triton step kernels; at S=64 fused total (31.6us) ≈ full-gemm floor (29.8us).
+- Confirms the hypothesis: single-LoRA + fuse A·B (rank-16 intermediate in SRAM, no HBM round-trip, no
+  multi-LoRA branches) ≈ a plain gemm. Remaining ~1.5x gap to floor at small S = the tiny-N (R=16) first dot.
+- New kernels: `triton_ops/kv_b_lora_single_fused.py` (`fused_q_correction`, `fused_v_correction`).
+
+### Next
+1. Wire fused kernels into `deepseek_mla_correction.py` (single-LoRA gate `num_segments==1`), replacing the
+   torch-bmm dense path. Keep Triton step kernels as multi-LoRA fallback.
+2. Kimi E2E: accuracy (logprob |Δ| within noise) + decode-isolated kv_b time (expect the `_step_*` rows to
+   drop ~2.7x). 3. Optional: tune block sizes to close the last ~1.5x to the floor.
