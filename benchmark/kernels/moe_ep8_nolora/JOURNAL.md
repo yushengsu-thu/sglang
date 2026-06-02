@@ -278,3 +278,16 @@ when it comes up, before drawing any comparison.
 3. Per user: **graph-off can be skipped** (no new kernels). **init-expert-location is not required** —
    only attempt the balancedness fallback (or drop to 4 GPU) if EP8 is clearly bad AND imbalance-bound.
 4. Post the comparison to PR #18 description; append results here.
+
+### 2026-06-02 23:55 (KST) — persist /root/.cache (autotune) across pod recreations
+- Found `/root/.cache` was **ephemeral** (677M of fp4_gemm autotune + triton/deep_gemm/HF caches, lost
+  on pod recreate). Added a hostPath mount `/root/.cache → /var/lib/sglang-cache` (node-local,
+  `DirectoryOrCreate`) to BOTH pod specs in: this branch's `kimi-2node.yaml`, the task yaml, the
+  canonical `sglang-lora-base-perf-benchmark.md` §3.1 (all 4 model pods), and created
+  `kimi-regression/assets/kimi-2node.yaml` (the file SKILL.md §1 referenced but was missing) + a note in
+  `kimi-regression/SKILL.md` robustness #2. So the ~20-min cold autotune is paid once **per node**, not
+  every fresh pod, going forward.
+- **Does NOT apply to the current pods** — k8s volumes are immutable post-creation; re-applying would
+  recreate the pods (killing the running EP8 cell + losing the model download). Future runs only.
+- Note: EP8 still re-autotunes vs TP8 even with the mount — different grouped-GEMM shapes
+  (48 vs 384 experts/rank) = separate cache entries. Observed EP8 cold step-1 ≈ 338s (matches base).
