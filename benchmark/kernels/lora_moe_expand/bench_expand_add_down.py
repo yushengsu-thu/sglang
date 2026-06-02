@@ -1,18 +1,28 @@
 """Self-contained micro-benchmark + correctness check for _moe_lora_expand_add_kernel
 (LoRA-B expand-add, down-proj GEMM).
 
-Companion to ``bench_shrink_splitk.py`` (which covers the LoRA-A shrink). Scoped to the
-qwen3.5-35b local-EP down-proj expand: tp=4/ep=4 -> 64 local experts, N (down output
-hidden) = 2048, rank = 16, top_k = 8. The down-proj expand uses the fused
-sum-all-reduce + routed-weight variant: each of a token's top_k per-expert deltas is
-scaled by its routing weight and atomic-added into the single per-token output row.
+Companion to ``bench_shrink_splitk.py`` (which covers the LoRA-A shrink). The down-proj
+expand uses the fused sum-all-reduce + routed-weight variant: each of a token's top_k
+per-expert deltas is scaled by its routing weight and atomic-added into the single
+per-token output row.
+
+Two model shapes via ``--model`` (per-flag overrides win):
+  * ``qwen35`` (default): qwen3.5-35b local-EP, tp=4/ep=4 -> 64 local experts, N (down
+    output hidden) = 2048, rank = 16, top_k = 8.
+  * ``kimi-k25``: Kimi-K2.5-NVFP4, TP8/no-EP -> 384 routed experts, N = 7168, rank = 16,
+    top_k = 8. (Shapes from the adapter + config: down-proj LoRA-B is [r=16 x out=7168],
+    384 routed experts.)
 
 P0 scope: bs=64, rank=16 first.
 
-  python3 bench_expand_add_down.py --mode bench
-  python3 bench_expand_add_down.py --mode correctness   # sweeps block_m {16,32,64} x bs {16,64}
+  python3 bench_expand_add_down.py --mode bench   --model kimi-k25
+  python3 bench_expand_add_down.py --mode correctness --model kimi-k25  # block_m {16,32,64} x bs {16,64}
   python3 bench_expand_add_down.py --mode profile --iters 2   # eager, for ncu
-  python3 bench_expand_add_down.py --mode sweep              # bs=64 r=16: block_m x group_m x warps
+  python3 bench_expand_add_down.py --mode sweep   --model kimi-k25      # block_m x block_n x group_m x warps
+
+``--mode sweep`` also tunes BLOCK_SIZE_N (the launcher's production default forces 128 for
+N%128==0; the sweep passes ``force_block_size_n`` to explore other tiles — valid for the
+non-gated down-proj).
 
 correctness mode also guards the routing/tiling block-size contract: the launcher must
 tile ``expert_ids`` with the same block size the routing buffers were aligned with, else
@@ -89,6 +99,7 @@ def expand(
     num_warps=4,
     mul_routed_weight=True,
     fuse_sum_all_reduce=True,
+    force_block_n=None,
 ):
     sorted_token_ids, expert_ids, num_tokens_post_padded = routing
     lora_b_virtual = lora_b.reshape(lora_b.shape[0] * lora_b.shape[1], *lora_b.shape[2:])
@@ -101,8 +112,10 @@ def expand(
         out_rows, n, dtype=intermediate.dtype, device=intermediate.device
     )
     config = {
+        # BLOCK_SIZE_N here is only used when N % 128 != 0 AND force_block_n is None;
+        # otherwise the launcher picks 128 (default) or force_block_n (tuning).
         "BLOCK_SIZE_M": block_m,
-        "BLOCK_SIZE_N": block_n,  # overridden to 128 by the launcher when N % 128 == 0
+        "BLOCK_SIZE_N": block_n,
         "GROUP_SIZE_M": group_m,
         "num_warps": num_warps,
     }
@@ -119,6 +132,7 @@ def expand(
         config,
         mul_routed_weight,
         fuse_sum_all_reduce,
+        force_block_size_n=force_block_n,
     )
     return output
 
@@ -186,45 +200,66 @@ def main():
         choices=["bench", "correctness", "profile", "sweep"],
         default="bench",
     )
+    # Model presets set (num_experts, n, top_k); per-flag overrides below win.
+    ap.add_argument("--model", choices=["qwen35", "kimi-k25"], default="qwen35")
     ap.add_argument("--bs", type=int, default=64)
-    ap.add_argument("--num-experts", type=int, default=64)
-    ap.add_argument("--top-k", type=int, default=8)
-    ap.add_argument("--n", type=int, default=2048, help="down-proj output hidden")
+    ap.add_argument("--num-experts", type=int, default=None)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--n", type=int, default=None, help="down-proj output hidden")
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--block-m", type=int, default=64)
-    ap.add_argument("--block-n", type=int, default=64)
+    ap.add_argument("--block-n", type=int, default=None,
+                    help="force BLOCK_SIZE_N (overrides the launcher's N%%128==0 -> 128 rule)")
     ap.add_argument("--group-m", type=int, default=1)
     ap.add_argument("--num-warps", type=int, default=4)
     ap.add_argument("--iters", type=int, default=2)
     ap.add_argument("--tol", type=float, default=5e-2)
     args = ap.parse_args()
 
+    # qwen35: tp4/ep4 -> 64 local experts, N=2048. kimi-k25: TP8/no-EP -> 384 experts, N=7168.
+    preset = {
+        "qwen35": {"num_experts": 64, "n": 2048, "top_k": 8},
+        "kimi-k25": {"num_experts": 384, "n": 7168, "top_k": 8},
+    }[args.model]
+    if args.num_experts is None:
+        args.num_experts = preset["num_experts"]
+    if args.n is None:
+        args.n = preset["n"]
+    if args.top_k is None:
+        args.top_k = preset["top_k"]
+
     dev = "cuda"
 
     if args.mode == "sweep":
-        # P0: bs=64, rank=16. Tunable knobs are BLOCK_SIZE_M / GROUP_SIZE_M / num_warps
-        # (the launcher forces BLOCK_SIZE_N=128 for N%128==0 and num_stages=1).
+        # P0: bs=64, rank=16. Tunable knobs: BLOCK_SIZE_M / BLOCK_SIZE_N / GROUP_SIZE_M /
+        # num_warps (num_stages is hardcoded to 1 in the launcher). BLOCK_SIZE_N is swept via
+        # force_block_size_n (the production path forces 128 for N%128==0); only divisors of N
+        # are tried so no tile is wasted.
         topk_ids, tkw, tlm, inter, lora_b = make_inputs(
             args.bs, args.num_experts, args.top_k, args.n, args.rank,
             torch.bfloat16, dev,
         )
+        block_ns = [bn for bn in [64, 128, 256, 512] if args.n % bn == 0]
         best = None
         for block_m in [16, 32, 64]:
             routing = build_v1_routing(topk_ids, tlm, args.num_experts, block_m)
-            for group_m in [1, 4, 8]:
-                for nw in [2, 4, 8]:
-                    f = lambda bm=block_m, gm=group_m, w=nw, r=routing: expand(
-                        inter, lora_b, topk_ids, tkw, r, bm, group_m=gm, num_warps=w
-                    )
-                    try:
-                        us = bench_ms(f, warmup=15, rep=60) * 1000
-                    except Exception:
-                        continue
-                    tag = f"block_m={block_m} group_m={group_m} warps={nw}"
-                    if best is None or us < best[0]:
-                        best = (us, tag)
-                    print(f"  {us:7.2f} us  {tag}")
-        print(f"\nBEST bs={args.bs} r={args.rank} N={args.n}: {best[0]:.2f} us  {best[1]}")
+            for block_n in block_ns:
+                for group_m in [1, 4, 8]:
+                    for nw in [2, 4, 8]:
+                        f = lambda bm=block_m, bn=block_n, gm=group_m, w=nw, r=routing: expand(
+                            inter, lora_b, topk_ids, tkw, r, bm,
+                            group_m=gm, num_warps=w, force_block_n=bn,
+                        )
+                        try:
+                            us = bench_ms(f, warmup=15, rep=60) * 1000
+                        except Exception:
+                            continue
+                        tag = f"block_m={block_m} block_n={block_n} group_m={group_m} warps={nw}"
+                        if best is None or us < best[0]:
+                            best = (us, tag)
+                        print(f"  {us:7.2f} us  {tag}")
+        print(f"\nBEST bs={args.bs} r={args.rank} N={args.n} experts={args.num_experts}: "
+              f"{best[0]:.2f} us  {best[1]}")
         return
 
     topk_ids, tkw, tlm, inter, lora_b = make_inputs(
@@ -233,8 +268,8 @@ def main():
     )
     routing = build_v1_routing(topk_ids, tlm, args.num_experts, args.block_m)
     fn = lambda: expand(
-        inter, lora_b, topk_ids, tkw, routing,
-        args.block_m, args.block_n, args.group_m, args.num_warps,
+        inter, lora_b, topk_ids, tkw, routing, args.block_m,
+        group_m=args.group_m, num_warps=args.num_warps, force_block_n=args.block_n,
     )
 
     if args.mode == "correctness":
@@ -257,8 +292,9 @@ def main():
             for bm in block_ms:
                 routing_bm = build_v1_routing(tk, tlm_b, args.num_experts, bm)
                 out = expand(
-                    inter_b, lb, tk, tkw_b, routing_bm,
-                    bm, args.block_n, args.group_m, args.num_warps,
+                    inter_b, lb, tk, tkw_b, routing_bm, bm,
+                    group_m=args.group_m, num_warps=args.num_warps,
+                    force_block_n=args.block_n,
                 ).float()
                 err = float((out - ref).abs().max().item())
                 rel = err / float(ref.abs().max().item() + 1e-9)
@@ -279,9 +315,13 @@ def main():
         torch.cuda.synchronize()
     else:
         ms = bench_ms(fn)
+        eff_block_n = args.block_n if args.block_n is not None else (
+            128 if args.n % 128 == 0 else args.block_n
+        )
         print(
-            f"BENCH expand_add down bs={args.bs} r={args.rank} N={args.n} top_k={args.top_k} "
-            f"block_m={args.block_m} group_m={args.group_m} warps={args.num_warps}: "
+            f"BENCH expand_add down model={args.model} bs={args.bs} r={args.rank} N={args.n} "
+            f"experts={args.num_experts} top_k={args.top_k} block_m={args.block_m} "
+            f"block_n={eff_block_n} group_m={args.group_m} warps={args.num_warps}: "
             f"{ms * 1000:.2f} us (amortized true device time)"
         )
 
