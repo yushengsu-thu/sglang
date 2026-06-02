@@ -56,6 +56,11 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
 
 ## Conventions
 
+- **Perf measurement rule (REQUIRED):** never read only the `bench_one_batch_server` e2e result.
+  Also read the **decode throughput (token/s) printed in the server log** (`/tmp/server.log`:
+  `Decode batch ... gen throughput (token/s): ...`) and report that per bs/variant. The e2e number
+  includes prefill + scheduling; the server-log decode thpt is the steady-state decode rate that the
+  TP8-vs-EP8 comparison actually hinges on.
 - k8s id: `yushengsu-<date>-<time>` (avoid resource conflicts).
 - Per skill.md: regression = `sglang-base-variant-regression.md` (Qwen) / `kimi-regression` (Kimi);
   perf = `sglang-lora-base-perf-benchmark.md`. Release nodes when done.
@@ -116,3 +121,22 @@ well and EP8 should not be much worse than TP8 on the no-LoRA baseline — while
    (tp=ep=4). Record deltas.
 6. Write findings + numbers into this JOURNAL and the PR description, **release the nodes**, push the
    results commit.
+
+---
+
+### 2026-06-02 — launch
+- `ID=yushengsu-20260602-220516`. Applied `kimi-2node.yaml` (ctx `leira`). Both pods
+  `mnnvl-kimi-${ID}-0/1` scheduled + Running within ~8s (nodes np-67167b3f-2 / -3, eu-iceland1-a).
+- Built branch bundle: `MAIN_BASE=fba083c80f` (merge-base sgl/main ↔ branch), 13 commits,
+  `/tmp/sglang-branch-moe-ep.bundle` (119K).
+- In-pod setup: numactl + hf accel installed, sglang cloned + `pip install -e` done, now downloading
+  `nvidia/Kimi-K2.5-NVFP4` (140 files, fp4) + `kimi_k25_lora_alpha`. Waiting for `/root/.setup-done`.
+- Next on setup-done: inject bundle into both pods, ghost-check + drop HBM page cache, run VARIANT=tp8.
+- 22:10 progress check: lora adapter (4 files) downloaded on both pods; base NVFP4 (140 files) at
+  ~96/140 (head) / ~74/140 (worker). pip install -e already done earlier in setup. Still waiting.
+- ~22:18 SETUP_DONE on both pods. Injected bundle: first fetch failed (bundle ref is
+  `moe-ep8-nolora-bench`, not `__bench_target`); re-fetched `moe-ep8-nolora-bench:refs/heads/__bench_target`
+  → both pods at `a20eb4601`. Ghost-check: all 8 GPUs clean (~<200 MiB / 189 GB GB200 HBM), no drain needed.
+- Starting **VARIANT=tp8 (control)** via `run_kimi_ep_vs_tp.sh` (driven locally): checkout __bench_target +
+  pip install -e, launch no-LoRA server, bench bs 16/32/64/128/256 (in/out 2048), profile graph-on
+  bs 16/64/128/256 + graph-off bs16. Running in background.
