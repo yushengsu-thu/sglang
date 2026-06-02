@@ -122,3 +122,22 @@ kernel beats the floor in isolation, THEN one Kimi E2E + accuracy pass.
 
 > Detailed chronological log (incl. every command) lives in
 > `river/task-lora-mla-stepab-dense-gemm/journal.md` (local). This file is the PR-facing summary.
+
+## 5. Micro-bench result (on Kimi pod, single GB200, real shapes) — hypothesis CONFIRMED
+
+`bench_kv_b_kernels.py`, per-layer decode, H=8/qk=128/kv=512/rank=16:
+
+| op | kernel µs (S=16/32/64) | full-bmm floor µs | verdict |
+|---|---|---|---|
+| step_a_q (S,H,128)->16 | 18.8 / 33.6 / 19.0 | ~11-14 | **1.7-2.4x SLOWER than full** |
+| step_b_q (S,H,16)->512 | 11.6 / 11.1 / 11.7 | ~11-13 | ≈floor |
+| step_a_v (S,H,512)->16 | 24.4 / 23.4 / 21.4 | ~11-13 | **1.9-2.1x SLOWER than full** |
+| step_b_v (S,H,16)->128 | 11.5 / 11.8 / 11.5 | ~11-13 | ≈floor |
+| **4-kernel sum** | **66 / 80 / 64 µs** | | |
+
+- **Confirmed:** the two `_step_a_*` (lora_a; large-K reduction → tiny N=rank=16) are ~2x SLOWER than the
+  full base bmm despite fewer FLOPs — occupancy/launch-bound from the tiny N=16 tile + multi-LoRA machinery.
+  `_step_b_*` are ≈ the floor. (cuBLAS same-size gemm is even slower — tiny-gemm dispatch overhead — so the
+  full-bmm ~11-13µs is the right floor.)
+- **Target:** get step_a_q/step_a_v to the full-gemm floor (~11µs) and fuse 4 steps → 2; aim 64-80µs → ~25-40µs.
+- Iteration loop is now seconds (this bench on 1 GPU), not a 40-min serve.
