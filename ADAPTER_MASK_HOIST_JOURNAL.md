@@ -51,30 +51,37 @@ scatter path), incl. the persistent cuda-graph buffer. So `adapter_enabled[i]==1
 
 All 3 models: variant vs base, both cells LoRA-on trtllm-LoRA + virtual-experts, differ only by this commit.
 
+Test matrix (per user, 2026-06-02): **only Qwen3-VL-30B-A3B-FP8 + Kimi-K2.5-NVFP4**, both via
+`sgl_flashinfer_trtllm` MoE LoRA. (Qwen3.5-35B dropped from the matrix.) Kimi config verified:
+moe_runner_backend=sgl_flashinfer_trtllm, lora_use_virtual_experts=True, "Virtual expert computation
+enabled", LoRA loaded on down_proj/gate_up_proj (MoE experts) + attention.
+
 **Accuracy — bs=1** (single-sequence per-token logprob capture). MoE LoRA uses atomic-add → run-to-run
 nondeterminism, so judged vs a base-vs-base noise floor:
 | Model | tokens (bs=1) | mean\|Δlogprob\| | noise floor | verdict |
 |-------|---------------|------------------|-------------|---------|
 | Qwen3-VL-30B-A3B-FP8 | 1820 | 0.0556 | 0.0581 (measured) | within noise |
-| Qwen3.5-35B-A3B-FP8  | 31999 | 0.0242 | 0.0227 (measured) | within noise |
 | Kimi-K2.5-NVFP4      | 1808 | 0.2873 | ~0.26–0.30 (documented) | within noise |
 
-**Performance — output throughput (tok/s), one table** (in/out 2048/2048). Qwen rows = bench e2e out-tput;
-Kimi rows = server-log decode throughput (median gen tok/s):
+**Performance — output throughput (tok/s), one table** (in/out 2048/2048). Qwen3-VL rows = bench e2e
+out-tput; Kimi rows = server-log decode throughput (median gen tok/s):
 | Model | bs | base tok/s | variant tok/s | Δ% | metric |
 |-------|----|-----------|---------------|-----|--------|
 | Qwen3-VL-30B-A3B-FP8 | 16 | 2142 | 2226 | +3.9% | e2e out |
 | Qwen3-VL-30B-A3B-FP8 | 32 | 3891 | 4041 | +3.9% | e2e out |
 | Qwen3-VL-30B-A3B-FP8 | 64 | 6983 | 7246 | +3.8% | e2e out |
-| Qwen3.5-35B-A3B-FP8  | 16 | 2201 | 2439 | +10.8% | e2e out |
-| Qwen3.5-35B-A3B-FP8  | 32 | 4137 | 4416 | +6.7% | e2e out |
-| Qwen3.5-35B-A3B-FP8  | 64 | 7493 | 7875 | +5.1% | e2e out |
 | Kimi-K2.5-NVFP4      | 16 | 675.5 | 660.9 | −2.2% | decode |
 | Kimi-K2.5-NVFP4      | 32 | 1213.6 | 1229.0 | +1.3% | decode |
 | Kimi-K2.5-NVFP4      | 64 | 2098.5 | 2085.1 | −0.6% | decode |
 
-→ no-op (acc within noise everywhere); faster on Qwen FP8; flat within noise on Kimi NVFP4 (decode
-dominated by fp4 MoE compute → removed mask kernels negligible). No regression on any model.
+⚠️ METRIC CAVEAT — the Qwen vs Kimi numbers are NOT directly comparable, and the Qwen perf is not rigorous:
+- Qwen3-VL = **bench e2e** (prefill+decode+sched), **single run/cell, NO perf noise floor**.
+- Kimi    = **decode-isolated** server-log tput, median of ~100 decode steps (stable).
+So "Qwen +3.9% vs Kimi ~0%" is mostly an artifact of (a) different metrics and (b) Qwen single-run variance,
+NOT a real decode speedup gap. The change removes per-layer overhead that the original profile noted was
+"5us but overlapped" + 3 sub-µs graph kernels → expected decode impact ≈ 0; Kimi's flat decode is the
+reliable signal. TODO to settle it: re-measure Qwen3-VL with the SAME decode-tput metric + repeats.
+(Qwen3.5-35B e2e showed +5–11% single-run — even less trustworthy, and out of the agreed matrix; excluded.)
 
 Kimi run notes (2026-06-02 22:44): run1 crashed on a run_kimi.sh bash bug (`local cell=$1 … ${cell}`
 same-line expand under set -u) during profiling → fixed + ran acc+bench only. Also fixed a cross-session
