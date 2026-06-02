@@ -214,3 +214,23 @@ graph and times replay (matches serving). S=64 (real bs=64 per TP rank):
   same regardless of commit) and was fully captured (acc/bench/serverlog/traces), so re-running VARIANT only.
 - LESSON: never leave untracked files in the bundle-checkout tree; always `checkout -f` + check the
   printed commit hash matches the intended one (verify testbed commit, like verifying testbed speed/shape).
+
+## 10. (2026-06-03 01:22) E2E #2 VALID — fused confirmed, acc OK, but E2E-NEUTRAL (overlap offsets it)
+
+- Trace confirms fused engaged: variant _fused_q_kernel=671, _fused_v_kernel=671, _step_*=0 (base _step_*=671).
+- **Accuracy PASS**: variant(fused) vs base(Triton) logprob mean|Δ|=0.242, p50 0.103 — within ~0.30 noise.
+- **Perf E2E (in=out=2048):** base vs variant essentially identical:
+  | bs | base out tok/s (ITL ms) | variant out tok/s (ITL ms) |
+  |---|---|---|
+  | 16 | 680 (23.51) | 666 (24.02) |
+  | 32 | 1210 (26.45) | 1200 (26.66) |
+  | 64 | 2068 (30.94) | 2080 (30.77) |
+  server-log decode thpt p50/p90: base 1210/2080, variant 1201/2089 — same.
+- **WHY E2E-neutral despite 2.7x kernel win:** baseline runs SGLANG_LORA_TWO_STREAM=1, so its big step_a_v/q
+  OVERLAP the base bmm (hidden); the fused kernel is monolithic → runs SERIALLY (prepare returns None), so
+  it forfeits that overlap. fused-serial (~6us) ≈ Triton-overlapped. Plus kv_b correction is only a few % of
+  decode ITL. Net: wash (±1-2% noise). This is the fuse-vs-overlap tension flagged in §4.
+- CONCLUSION: fused single-LoRA kernel is correct + 2.7x faster in isolation + hits the full-gemm floor
+  (validates the user's hypothesis), but in the shipped two-stream config it does NOT improve E2E. Flag
+  stays default-off. Options: (a) accept (document the kernel, keep off); (b) make fused overlap too;
+  (c) compare both non-overlapped to confirm the kernel win in that regime; (d) target a bigger decode lever.
