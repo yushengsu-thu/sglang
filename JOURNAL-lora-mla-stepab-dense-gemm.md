@@ -253,3 +253,10 @@ separate kernel / on a different stream). bench_kv_b_split.py (cuda-graph regime
 version forfeited this by running serially). This is the real E2E lever.
 - Next: wire split single-LoRA kernels into the two-stream prepare(step_a, side stream)/apply(step_b)
   path for single-LoRA; keep fused only as a no-two-stream fallback. Then Kimi E2E to measure the win.
+
+## 12. (2026-06-03 11:40) Nodes released (user: stop job + release)
+- Stopped all local run jobs; deleted pods mnnvl-kimi-ys-mla-0602-1754-0/1 + service + computedomain on leira. Verified gone.
+- State at stop: split single-LoRA step_a/b kernels written + bit-exact + benched (graph regime), step_a hits
+  base-bmm budget. NOT yet wired into the two-stream path; NO E2E for approach C yet.
+- TO RESUME: relaunch pods (task dir kimi-2node-ys.yaml, ID reusable or new), inject branch, then wire split
+  kernels into two-stream prepare(step_a)/apply(step_b) for single-LoRA + Kimi E2E (acc + server-log decode thpt).
