@@ -411,3 +411,15 @@ hold a server past bs16-128 to measure it**.
   the ~0.30 noise floor but near the edge (vs 0.11 for no-LoRA); no clear regression, worth a recheck.
 - **The gating issue is EP8 stability**, not throughput: EP8 (±LoRA) reproducibly tears down at the
   graph-capture / first-serve boundary or mid-bench at larger bs. That's the thing to fix to make EP usable.
+
+### 2026-06-03 11:40 (KST) — job stopped, nodes released
+- User: stop job + release nodes. Killed local drivers/launchers + in-pod servers; deleted the k8s
+  resources for `ID=yushengsu-20260602-220516` (pods `-0/-1`, service `-head`, computedomain). Verified
+  0 remaining pods for this ID; other users' kimi pods untouched. GPUs freed.
+- **Final summary (no-LoRA + LoRA, all in JOURNAL + PR #18):**
+  - no-LoRA: EP8 crosses TP8 ~bs64, **+9% at bs128**; slightly slower at small bs. bs256 unmeasured (EP8 unstable).
+  - +LoRA: **EP8+LoRA +13% at bs16**, LoRA tax 47%→39% — EP cuts the LoRA-kernel tax (P0 confirmed).
+    Larger-bs +LoRA unmeasured (EP8+LoRA crashes at bs>=32).
+  - acc within noise floor (no-LoRA 0.11, +LoRA 0.29).
+  - **Open / blocker: EP8 server stability** (teardown at capture/serve boundary, ±LoRA) — must fix
+    before EP is usable; then re-measure EP8 large-bs (±LoRA) to quantify the full win.
