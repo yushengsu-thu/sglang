@@ -90,6 +90,22 @@ A/B 設計（同 commit `58ba52bcfe`，隔離 feature 本身）：
 - RUN_ROOT=`~/Downloads/sglang_regression_yushengsu-20260604-1329`
 - driver：`river/moe-down-lora-overlap-finalize/run_qwen35.sh`
 
+## 驗證 debug 記錄 (2026-06-04 14:05)
+
+1. **第一次 driver run 失敗**：checkout 後靜默 exit 1，把背景 `kubectl exec`（server 前台）連帶
+   殺掉（server 死在 DeepGEMM warmup 80%，無錯誤——是被殺的，不是 crash）。兩個潛在因素都修了：
+   - `checkout()` 的 `pip install -e python` 因 `bash -lc` 非互動 shell 沒 source `~/.cargo/env`
+     → 找不到 rustc 而失敗（舊版不檢查 rc，靜默吞掉）。修：source cargo env + pip 失敗即 exit。
+   - `wait_ready` 原本是單一條 30 分鐘的 in-pod kubectl exec，一次瞬斷就觸發 `set -e` 全滅。
+     修：改本地循環、每次探測獨立短 kubectl exec。
+2. **第二次 run（-x）真錯誤現形**：server 啟動 crash —
+   `flashinfer-jit-cache (0.6.12+cu130) != flashinfer (0.6.11.post1)`。
+   原因：branch pyproject pin `flashinfer_python==0.6.11.post1`，checkout 的 pip install 把
+   flashinfer 降版，image 的 jit-cache 還是 0.6.12。
+   修：pod 裝 `flashinfer-jit-cache==0.6.11.post1+cu130`（flashinfer.ai/whl/cu130）。
+   （jit-cache 不在 pyproject deps，後續 cell 的 pip install 不會再動它。）
+3. 14:05 第三次 driver run 啟動。
+
 ## 實作完成 (2026-06-04 12:40)
 
 改動（6 檔，+144/-31）：
