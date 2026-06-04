@@ -323,7 +323,8 @@ void dispatchExperts(
       TSP_LAUNCH(512);
       break;
     default:
-      RuntimeCheck(false, "topk_softmax_pack: num_experts must be a power of 2 in [1, 512], got ", num_experts);
+      host::RuntimeCheck(
+          false, "topk_softmax_pack: num_experts must be a power of 2 in [1, 512], got ", num_experts);
   }
 #undef TSP_LAUNCH
 }
