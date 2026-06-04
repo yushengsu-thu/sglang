@@ -138,6 +138,35 @@ V1（delta buffer + post-finalize add）已經避開了寫衝突，但 V2 更保
 不變（gate_up 等其他 caller 不受影響）；moe_overlap.py 兩路徑改用兩段式呼叫。
 舊版 V1 驗證 run 已停掉，將以 V2 commit 重新驗證。
 
+## V2 驗證結果：PASS (2026-06-04 15:47–16:00)
+
+V2 commit `eac0e96c47`，pod `sglang-qwen35-yushengsu-20260604-1329`（Qwen3.5-35B-A3B-FP8
+tp4/ep4）。兩 cell 同 commit、LoRA on、`sgl_flashinfer_trtllm`、`SGLANG_LORA_TWO_STREAM=1`；
+variant 多 `SGLANG_OPT_LORA_DOWN_FINALIZE_OVERLAP=1`（launch 命令 xtrace 已驗證 env 帶到）。
+base/variant server 都是 warm relaunch（V2 未改 C++，JIT cache 命中 → READY ~50s）。
+
+### ACC（per-token logprobs，31999 tokens）✅
+- base vs variant：max|Δ|=3.00，mean|Δ|=0.0240，nonzero 31540/31999
+- 參照 noise floor（同日 prezero 任務的「預期等價」A/B，同 workload 同機型）：
+  max|Δ|=6.07，mean|Δ|=0.0248 → **我們的差異在 atomic-add noise floor 之內（略好）**
+  （down expand 用 `tl.atomic_add`，加法順序非確定 → 跨 launch 本來就非 bitwise）
+
+### PERF（bench_one_batch_server 2048/2048）✅
+| bs | base lat(s) | var lat(s) | base out tok/s | var out tok/s | Δ out thpt |
+|---|---|---|---|---|---|
+| 16 | 11.86 | 11.67 | 2946.0 | 2984.3 | **+1.30%** |
+| 32 | 13.89 | 13.63 | 5243.5 | 5352.5 | **+2.08%** |
+| 64 | 17.29 | 17.02 | 9089.8 | 9229.5 | **+1.54%** |
+
+ITL(ms)：5.43→5.36 / 6.10→5.98 / 7.04→6.93。
+
+### Server-log decode thpt（DECODE-THPT-RULE）✅
+bs64 段 gen throughput (token/s)：base ~9036–9067，variant ~9115–9189（**+~1.3%**）
+→ 與 e2e bs64 +1.54% 一致，非測量假象。
+
+結論：V2（shrink-only overlap）acc 在 noise floor 內、decode thpt +1.3~2.1%，全 bs 正向。
+artifacts：`~/Downloads/sglang_regression_yushengsu-20260604-1329/qwen35/`。
+
 ## 實作完成 (2026-06-04 12:40)
 
 改動（6 檔，+144/-31）：
