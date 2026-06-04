@@ -275,9 +275,13 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             )
 
             # 2 shrink GEMMs (gate_up-A, down-A) per MoE layer, each up to
-            # max_bs decode tokens x top_k x max_lora_rank. ~tens of MB; falls
-            # back to per-call torch.zeros when a batch outgrows it (prefill).
-            max_slice_numel = max_bs * top_k * max_lora_rank
+            # max_bs decode tokens x top_k x the A-stage output rank. For the
+            # gated gate_up the A output carries gate+up = 2*r rows (the down
+            # A is 1*r), so size the per-slice budget with 2*max_lora_rank --
+            # observed live: with 1*r the bs>32 gate_up slice (M*top_k*2r)
+            # exceeded the budget and silently fell back to per-call zeros.
+            # ~tens of MB; prefill-sized batches still fall back by design.
+            max_slice_numel = max_bs * top_k * (2 * max_lora_rank)
             set_moe_lora_zero_buffer(
                 torch.zeros(
                     (num_moe_layers * 2 * max_slice_numel,),
