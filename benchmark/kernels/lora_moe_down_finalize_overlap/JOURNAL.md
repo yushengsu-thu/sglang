@@ -71,7 +71,8 @@ env-var-conventions skill）。
 
 ## 驗證計畫 (2026-06-04 13:29)
 
-測試矩陣（已跟用戶確認）：**只測 Qwen3.5-35B-A3B-FP8**（tp4/ep4，單 node 4 GPU）。
+測試矩陣（已跟用戶確認，2026-06-04 14:05 + 15:0x 再次確認 FP4/Kimi 先不測）：
+**只測 Qwen3.5-35B-A3B-FP8**（tp4/ep4，單 node 4 GPU）。
 Kimi 不開 env var → 走原路徑，正確性/perf 不受影響（default off；env off 時 Python 走原 serial
 分支、C++ 收 handle=0 不 record，唯一差異是 csrc hash 變了會重編一次 JIT）。
 
@@ -105,6 +106,16 @@ A/B 設計（同 commit `58ba52bcfe`，隔離 feature 本身）：
    修：pod 裝 `flashinfer-jit-cache==0.6.11.post1+cu130`（flashinfer.ai/whl/cu130）。
    （jit-cache 不在 pyproject deps，後續 cell 的 pip install 不會再動它。）
 3. 14:05 第三次 driver run 啟動。
+4. **第三/四次 run：acc OOM**（兩次，同點位）：logprob capture 是單一 ~30k-token seq，
+   `logits_processor._copy_logits_to_buffer` 的 `logits[:,:vocab].float()` 按單次 extend 的
+   token 數配 float32 logits（~248k vocab → 29.6 GiB），mem-fraction 0.75 後 free 26.7 GiB
+   仍不夠 → server SIGQUIT → acc/bench connection refused。
+   （旁證：另一 session 的 prezero regression 同設定也反覆撞 server 死，progress 顯示 acc
+   重試三次才過——本質是 26.7 vs 29.6 的邊緣狀態。）
+   修：`PREFILL_ARGS` 改 `--max-prefill-tokens 8192 --chunked-prefill-size 8192`，
+   峰值降到 ~8 GB；chunked prefill 對 per-token logprob 數值精確，兩 cell 同設定 A/B 公平。
+   另：driver 改 `nohup+disown` 脫離（背景 task 兩度被外部殺，macOS 無 setsid）。
+5. 15:2x 第五次 driver run 啟動（pid 94151）。
 
 ## 實作完成 (2026-06-04 12:40)
 
