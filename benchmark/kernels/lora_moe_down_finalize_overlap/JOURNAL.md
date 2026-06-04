@@ -67,7 +67,28 @@ env-var-conventions skill）。
 - [x] Step 2: commit + push + 開 PR（per 用戶指示先不跑 regression/bench）
   - commit `4883cd71b5`，branch push 到 origin（yushengsu-thu fork；jybsuper 無 push 權限）
   - PR: https://github.com/jybsuper/sglang/pull/26 (2026-06-04 12:45)
-- [ ] （後續）compile 驗證 + Qwen/Kimi regression + perf bench（e2e + server-log decode thpt）
+- [x] Step 3: 正確性驗證（進行中，見下）
+
+## 驗證計畫 (2026-06-04 13:29)
+
+測試矩陣（已跟用戶確認）：**只測 Qwen3.5-35B-A3B-FP8**（tp4/ep4，單 node 4 GPU）。
+Kimi 不開 env var → 走原路徑，正確性/perf 不受影響（default off；env off 時 Python 走原 serial
+分支、C++ 收 handle=0 不 record，唯一差異是 csrc hash 變了會重編一次 JIT）。
+
+A/B 設計（同 commit `58ba52bcfe`，隔離 feature 本身）：
+- base：LoRA on + `--moe-runner-backend sgl_flashinfer_trtllm` + `SGLANG_LORA_TWO_STREAM=1`
+- variant：同上 + `SGLANG_OPT_LORA_DOWN_FINALIZE_OVERLAP=1`
+- acc：per-token logprobs over compare_sample_train_data.pt，預期數值等價（ACC_TOL=0.01；
+  已知 lora delta 多一次 bf16 rounding，應在 atomic-add noise floor 內）
+- bench：bench_one_batch_server bs 16/32/64，2048/2048；**記 e2e + server.log decode thpt**
+  （per DECODE-THPT-RULE，run script 每個 cell 保存 /tmp/server.log）
+
+執行：
+- ID=`yushengsu-20260604-1329`，pod `sglang-qwen35-yushengsu-20260604-1329`（13:29 apply，
+  node np-67167b3f-7）
+- bundle `58ba52bcfe`（mb `f6d0beaca8e3` vs sgl/main）已建好待注入
+- RUN_ROOT=`~/Downloads/sglang_regression_yushengsu-20260604-1329`
+- driver：`river/moe-down-lora-overlap-finalize/run_qwen35.sh`
 
 ## 實作完成 (2026-06-04 12:40)
 
