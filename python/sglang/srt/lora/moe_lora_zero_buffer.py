@@ -23,13 +23,23 @@ import torch
 
 _MOE_LORA_ZERO_BUFFER: torch.Tensor | None = None
 _MOE_LORA_ZERO_PTR: int = 0
+_MOE_LORA_ZERO_MAX_SLICE: int = 0
 
 
-def set_moe_lora_zero_buffer(buffer: torch.Tensor | None) -> None:
-    """Install (or clear) the persistent pre-zeroed bump buffer."""
-    global _MOE_LORA_ZERO_BUFFER, _MOE_LORA_ZERO_PTR
+def set_moe_lora_zero_buffer(
+    buffer: torch.Tensor | None, max_slice_numel: int = 0
+) -> None:
+    """Install (or clear) the persistent pre-zeroed bump buffer.
+
+    ``max_slice_numel`` is the per-GEMM slice budget the buffer was sized with
+    (max_bs * top_k * max_lora_rank). Requests above it are refused (fallback)
+    so a single forward can never consume more than the whole buffer — the
+    invariant that makes the wraparound in ``take_zeroed_slice`` safe.
+    """
+    global _MOE_LORA_ZERO_BUFFER, _MOE_LORA_ZERO_PTR, _MOE_LORA_ZERO_MAX_SLICE
     _MOE_LORA_ZERO_BUFFER = buffer
     _MOE_LORA_ZERO_PTR = 0
+    _MOE_LORA_ZERO_MAX_SLICE = max_slice_numel
 
 
 def reset_moe_lora_zero_buffer() -> None:
@@ -46,16 +56,31 @@ def reset_moe_lora_zero_buffer() -> None:
 def take_zeroed_slice(
     numel: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor | None:
-    """Bump-allocate a pre-zeroed slice; None if unavailable (caller falls back)."""
+    """Bump-allocate a pre-zeroed slice; None if unavailable (caller falls back).
+
+    Wraps to offset 0 when the tail is too small instead of failing: cuda-graph
+    capture runs 2 warmup forwards + 1 captured forward after a SINGLE
+    prepare_lora_batch pointer reset, so without wrapping the captured forward
+    exhausts the buffer and bakes the per-call torch.zeros fallback into the
+    graph (observed: zero engagement). Wrap safety: every request is capped at
+    ``max_slice_numel`` and each forward issues at most (num_layers * 2)
+    requests, so one forward never consumes more than the whole buffer — the
+    post-wrap linear span therefore cannot overlap the same forward's pre-wrap
+    slices (post-wrap span <= start offset). Stale warmup values don't matter:
+    capture results are discarded and every replay/eager step re-zeroes the
+    whole buffer first.
+    """
     global _MOE_LORA_ZERO_PTR
     buf = _MOE_LORA_ZERO_BUFFER
     if (
         buf is None
         or buf.dtype != dtype
         or buf.device != device
-        or _MOE_LORA_ZERO_PTR + numel > buf.numel()
+        or numel > _MOE_LORA_ZERO_MAX_SLICE
     ):
         return None
+    if _MOE_LORA_ZERO_PTR + numel > buf.numel():
+        _MOE_LORA_ZERO_PTR = 0
     out = buf[_MOE_LORA_ZERO_PTR : _MOE_LORA_ZERO_PTR + numel]
     _MOE_LORA_ZERO_PTR += numel
     return out
