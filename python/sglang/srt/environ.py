@@ -458,6 +458,14 @@ class Envs:
     # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
     # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.
     SGLANG_OPT_LORA_SHRINK_TUNE = EnvBool(False)
+    # Overlap the MoE shared-expert add with the down-LoRA shrink (Qwen FP8 trtllm-lora dual-stream
+    # decode path). Instead of `final_hidden_states += shared_output` running on the main stream AFTER
+    # the whole alt-stream MoE+LoRA chain joins, the LoRA dispatch enqueues the add on the main stream
+    # right after the base-MoE finalize writes the output buffer — concurrent with the down-LoRA shrink
+    # (which only writes its own intermediate). The down-LoRA expand (atomic_add into the same output
+    # buffer) waits on the add via an event, so the two writers never run concurrently. See
+    # lora/trtllm_moe/shared_add_overlap.py. Default off.
+    SGLANG_OPT_LORA_SHARED_ADD_OVERLAP = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
