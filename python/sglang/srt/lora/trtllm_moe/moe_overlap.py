@@ -11,6 +11,7 @@ their behavior is byte-identical to the unpatched code path.
 """
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.lora.trtllm_moe import (
     get_lora_side_stream,
     get_original_fp4_moe_lora_func,
@@ -171,6 +172,25 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
         _LORA_OVERLAP_EVENTS.append(lora_event)
     lora_ready_handle = lora_event.cuda_event
 
+    # Down-LoRA/finalize overlap (env-gated): the op records gemm2_done_event right after the
+    # base down GEMM (before finalize); the side stream waits on it and runs the down-proj LoRA
+    # shrink/expand into a zeroed delta concurrent with finalizeKernel. The expand can't add
+    # into `output` directly here -- finalize WRITES output concurrently -- so it accumulates
+    # into down_delta and the main stream adds it post-finalize.
+    down_overlap = envs.SGLANG_OPT_LORA_DOWN_FINALIZE_OVERLAP.get()
+    gemm2_done_handle = 0
+    if down_overlap:
+        gemm2_done_event = torch.cuda.Event()
+        # Materialize the underlying cudaEvent (torch creates it lazily on first record) so
+        # .cuda_event is a real handle; the op re-records it after GEMM2.
+        gemm2_done_event.record()
+        gemm2_done_handle = gemm2_done_event.cuda_event
+        down_delta = torch.empty(
+            (hidden_states.shape[0], hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
     moe_result = trtllm_fp8_block_scale_routed_moe_lora(
         topk_ids=packed_topk_ids,
         routing_bias=None,
@@ -206,27 +226,49 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
         tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
         fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
         activation_type=quant_info.activation_type,
+        gemm2_done_event=gemm2_done_handle,
     )
 
     output = moe_result
-    merged_experts_fused_moe_lora_add(
-        output=output,
-        hidden_states=activation_lora_input.view(-1, quant_info.intermediate_size),
-        lora_a=lora_info.down_lora_a_weights,
-        lora_b=lora_info.down_lora_b_weights,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        token_lora_mapping=token_lora_mapping,
-        mul_routed_weight=True,
-        experts_shared_outer_loras_a=False,
-        experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-        routing_cache=fused_lora_routing_cache,
-        fuse_add_to_output=False,
-        fuse_sum_all_reduce=True,
-        use_direct_expand_add=lora_info.max_lora_rank <= 64,
-        local_expert_offset=quant_info.local_expert_offset,
-        local_num_experts=quant_info.local_num_experts,
-    )
+
+    def _run_down_lora(out):
+        merged_experts_fused_moe_lora_add(
+            output=out,
+            hidden_states=activation_lora_input.view(-1, quant_info.intermediate_size),
+            lora_a=lora_info.down_lora_a_weights,
+            lora_b=lora_info.down_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=True,
+            experts_shared_outer_loras_a=False,
+            experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+            routing_cache=fused_lora_routing_cache,
+            fuse_add_to_output=False,
+            fuse_sum_all_reduce=True,
+            use_direct_expand_add=lora_info.max_lora_rank <= 64,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+        )
+
+    if down_overlap:
+        # Fork at "base down GEMM done": the side stream starts the down-proj LoRA as soon
+        # as GEMM2 finishes, concurrent with the main-stream finalizeKernel. The expand
+        # atomic-adds into the zeroed down_delta (fuse_sum_all_reduce skips -1 expert blocks,
+        # so the buffer must be pre-zeroed); the main stream joins and adds it post-finalize.
+        side_stream.wait_event(gemm2_done_event)
+        down_done_event = torch.cuda.Event()
+        with torch.cuda.stream(side_stream):
+            down_delta.zero_()
+            _run_down_lora(down_delta)
+            down_done_event.record()
+        if torch.cuda.is_current_stream_capturing():
+            _LORA_OVERLAP_EVENTS.append(gemm2_done_event)
+            _LORA_OVERLAP_EVENTS.append(down_done_event)
+        torch.cuda.current_stream().wait_event(down_done_event)
+        output += down_delta
+    else:
+        _run_down_lora(output)
     return StandardCombineInput(hidden_states=output)
 
 
@@ -279,11 +321,13 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
     token_lora_mapping = lora_info.token_lora_mapping
     fused_lora_routing_cache: dict = {}
 
-    # Down-proj LoRA runs serially on the main stream (after the trtllm op). The side-stream
-    # down-overlap was removed: bench-verified net-neutral-to-negative (the extra side-stream
-    # all-reduce cancels any overlap gain), AND its act_ready_event cross-stream sync corrupted
-    # decode state under sustained heavy LoRA load (cuda-graph replay -> persistent garbage). Only
-    # the gate_up overlap (O1-fp4, below) is kept; it is bench-safe under the same load.
+    # Down-proj LoRA runs serially on the main stream (after the trtllm op) by default. The old
+    # side-stream down-overlap was removed: bench-verified net-neutral-to-negative (the extra
+    # side-stream all-reduce cancels any overlap gain), AND its act_ready_event cross-stream sync
+    # corrupted decode state under sustained heavy LoRA load (cuda-graph replay -> persistent
+    # garbage). SGLANG_OPT_LORA_DOWN_FINALIZE_OVERLAP=1 re-introduces a more conservative variant:
+    # fork at gemm2_done (not act_ready), expand into a private zeroed delta, final add on the
+    # MAIN stream -- overlapping only the finalize kernel.
     inter = quant_info.intermediate_size_per_partition
     side_stream = get_lora_side_stream()
 
@@ -342,6 +386,23 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
         _LORA_OVERLAP_EVENTS.append(lora_event)
     lora_ready_handle = lora_event.cuda_event
 
+    # Down-LoRA/finalize overlap (env-gated, see the comment above): record gemm2_done inside
+    # the op, run the down-proj LoRA on the side stream into a zeroed delta concurrent with
+    # finalize, add the delta on the main stream after the op.
+    down_overlap = envs.SGLANG_OPT_LORA_DOWN_FINALIZE_OVERLAP.get()
+    gemm2_done_handle = 0
+    if down_overlap:
+        gemm2_done_event = torch.cuda.Event()
+        # Materialize the underlying cudaEvent (torch creates it lazily on first record) so
+        # .cuda_event is a real handle; the op re-records it after the down GEMM.
+        gemm2_done_event.record()
+        gemm2_done_handle = gemm2_done_event.cuda_event
+        down_delta = torch.empty(
+            (hidden_states.shape[0], hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
     output = trtllm_fp4_block_scale_routed_moe_lora(
         topk_ids=packed_topk_ids,
         routing_bias=None,
@@ -370,6 +431,7 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
         routing_method_type=quant_info.routing_method_type,
         do_finalize=True,
         output=direct_down_output,
+        gemm2_done_event=gemm2_done_handle,
     )
 
     def _run_down_lora(out):
@@ -392,5 +454,20 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
             local_num_experts=quant_info.local_num_experts,
         )
 
-    _run_down_lora(output)
+    if down_overlap:
+        # Fork at "base down GEMM done": side-stream down-proj LoRA concurrent with the
+        # main-stream finalize; main stream joins and adds the delta post-finalize.
+        side_stream.wait_event(gemm2_done_event)
+        down_done_event = torch.cuda.Event()
+        with torch.cuda.stream(side_stream):
+            down_delta.zero_()
+            _run_down_lora(down_delta)
+            down_done_event.record()
+        if torch.cuda.is_current_stream_capturing():
+            _LORA_OVERLAP_EVENTS.append(gemm2_done_event)
+            _LORA_OVERLAP_EVENTS.append(down_done_event)
+        torch.cuda.current_stream().wait_event(down_done_event)
+        output += down_delta
+    else:
+        _run_down_lora(output)
     return StandardCombineInput(hidden_states=output)
