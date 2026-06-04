@@ -458,6 +458,13 @@ class Envs:
     # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
     # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.
     SGLANG_OPT_LORA_SHRINK_TUNE = EnvBool(False)
+    # Move the MoE LoRA shrink-intermediate zero-fill off the critical path. The split-K shrink
+    # accumulates with atomic_add, so its intermediate must be pre-zeroed; by default that
+    # torch.zeros fill sits right before the shrink on the LoRA chain. Set =1 to (a) issue the
+    # fill on a dedicated prezero stream concurrent with the routing/align kernels, and (b) on
+    # the two-stream MoE paths, pre-zero the down-proj intermediate on the side stream while the
+    # main stream runs the trtllm MoE op (fill fully hidden). Event fork/join, graph-safe.
+    SGLANG_OPT_LORA_MOE_PREZERO = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
