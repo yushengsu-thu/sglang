@@ -458,14 +458,14 @@ class Envs:
     # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
     # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.
     SGLANG_OPT_LORA_SHRINK_TUNE = EnvBool(False)
-    # Move the MoE LoRA down-proj shrink-intermediate zero-fill off the critical path. The
-    # split-K shrink accumulates with atomic_add, so its intermediate must be pre-zeroed; by
-    # default that torch.zeros fill sits right before the shrink on the LoRA chain. Set =1 to
-    # pre-zero the down-proj intermediate on the LoRA side stream while the main stream runs
-    # the trtllm MoE op (fill fully hidden; two-stream FP8/FP4 MoE dispatches only). Bench:
-    # perf-neutral on Qwen3.5-35B decode. A wider variant that also overlapped the gate_up fill
-    # with the routing kernels on a dedicated stream was bench-rejected (-6..-11% decode thpt:
-    # the cross-stream join broke the align->shrink PDL chain).
+    # Replace the per-call MoE LoRA shrink-intermediate torch.zeros (2 fills per MoE layer per
+    # step; split-K shrink accumulates with atomic_add so its intermediate must be pre-zeroed)
+    # with a dsv3-style bump allocator: one persistent buffer (num_moe_layers x 2 x max_bs x
+    # top_k x max_lora_rank, allocated pre-memory-profiling) is zeroed ONCE per forward in
+    # prepare_lora_batch (outside any cuda graph), and each gate_up-A / down-A GEMM bump-takes
+    # a fresh slice. Batches that outgrow the buffer (prefill) fall back to per-call zeros.
+    # Earlier stream-overlap variants were bench-rejected: per-call cross-stream fork/join
+    # around the shrink cost 6-11% decode throughput.
     SGLANG_OPT_LORA_MOE_PREZERO = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087

@@ -2047,16 +2047,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         max_bs = self.server_args.cuda_graph_max_bs
         max_loras = self.server_args.max_loras_per_batch
-        for module in self.model.modules():
-            if isinstance(module, FusedMoEWithLoRA):
-                self.lora_manager.init_cuda_graph_moe_buffers(
-                    max_bs, max_loras, self.dtype, module
-                )
-                logger.info(
-                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                    f"(max_bs={max_bs}, max_loras={max_loras})"
-                )
-                break
+        moe_lora_modules = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, FusedMoEWithLoRA)
+        ]
+        if moe_lora_modules:
+            self.lora_manager.init_cuda_graph_moe_buffers(
+                max_bs,
+                max_loras,
+                self.dtype,
+                moe_lora_modules[0],
+                num_moe_layers=len(moe_lora_modules),
+            )
+            logger.info(
+                f"Pre-allocated shared MoE LoRA CUDA graph buffers "
+                f"(max_bs={max_bs}, max_loras={max_loras}, "
+                f"num_moe_layers={len(moe_lora_modules)})"
+            )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""

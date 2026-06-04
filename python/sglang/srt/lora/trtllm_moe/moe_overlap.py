@@ -11,7 +11,6 @@ their behavior is byte-identical to the unpatched code path.
 """
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.lora.trtllm_moe import (
     get_lora_side_stream,
     get_original_fp4_moe_lora_func,
@@ -24,27 +23,6 @@ from sglang.srt.lora.trtllm_moe import (
 # before graph instantiation. Only appended while capturing; eager runs rely on CUDA's
 # deferred cudaEventDestroy.
 _LORA_OVERLAP_EVENTS: list = []
-
-
-def _prezero_down_intermediate_on_side_stream(
-    hidden_states: torch.Tensor,
-    topk_ids: torch.Tensor,
-    max_lora_rank: int,
-):
-    """Allocate (on the current/consumer stream) the down-proj LoRA shrink
-    intermediate; the caller zeroes it on the side stream right after the
-    gate_up LoRA, where the fill hides behind the main-stream trtllm MoE op
-    instead of sitting on the LoRA chain before the down shrink.
-
-    Returns None when SGLANG_OPT_LORA_MOE_PREZERO is off.
-    """
-    if not envs.SGLANG_OPT_LORA_MOE_PREZERO.get():
-        return None
-    # Matches _merged_experts_fused_moe_lora_add_impl's intermediate_shape
-    # ([num_tokens, top_k, max_lora_rank]; token_lora_mapping has num_tokens rows).
-    return hidden_states.new_empty(
-        (hidden_states.shape[0], topk_ids.shape[1], max_lora_rank)
-    )
 
 
 def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
@@ -151,23 +129,12 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     # whole op.
     lora_event = torch.cuda.Event()
 
-    # SGLANG_OPT_LORA_MOE_PREZERO: pre-zero the down-proj shrink intermediate on the side
-    # stream right AFTER lora_event (so it doesn't delay the activation join) — the fill
-    # hides behind the main-stream trtllm op instead of preceding the down shrink.
-    down_intermediate = _prezero_down_intermediate_on_side_stream(
-        hidden_states, topk_ids, lora_info.max_lora_rank
-    )
-    down_prezero_event = torch.cuda.Event() if down_intermediate is not None else None
-
     # O1 fork — gate_up shrink/expand on side stream concurrent with the main-stream
     # per-token-group FP8 quant + the trtllm op's permute+GEMM1 below.
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         _run_gate_up_lora()
         lora_event.record()
-        if down_intermediate is not None:
-            down_intermediate.zero_()
-            down_prezero_event.record()
 
     # Fuse the per-token scale transpose into the quant kernel: column-major scales make
     # the `.t()` a free view, dropping the standalone ~2us transpose+copy. The trtllm MoE
@@ -202,8 +169,6 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     # cuda-graph capture so the captured cross-stream wait isn't torn down before instantiation.
     if torch.cuda.is_current_stream_capturing():
         _LORA_OVERLAP_EVENTS.append(lora_event)
-        if down_prezero_event is not None:
-            _LORA_OVERLAP_EVENTS.append(down_prezero_event)
     lora_ready_handle = lora_event.cuda_event
 
     moe_result = trtllm_fp8_block_scale_routed_moe_lora(
@@ -244,9 +209,6 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     )
 
     output = moe_result
-    if down_prezero_event is not None:
-        # Join: the down shrink (first consumer) must observe the side-stream fill.
-        torch.cuda.current_stream().wait_event(down_prezero_event)
     merged_experts_fused_moe_lora_add(
         output=output,
         hidden_states=activation_lora_input.view(-1, quant_info.intermediate_size),
@@ -264,7 +226,6 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
-        prezeroed_intermediate=down_intermediate,
     )
     return StandardCombineInput(hidden_states=output)
 
@@ -353,20 +314,10 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
     # FP4 op's permute + gate_up GEMM1 below. The op waits on lora_event right
     # before its activation kernel (the only consumer of gate_up_delta).
     lora_event = torch.cuda.Event()
-    # SGLANG_OPT_LORA_MOE_PREZERO: pre-zero the down-proj shrink intermediate on
-    # the side stream right AFTER lora_event — the fill hides behind the
-    # main-stream FP4 trtllm op instead of preceding the down shrink.
-    down_intermediate = _prezero_down_intermediate_on_side_stream(
-        hidden_states, topk_ids, lora_info.max_lora_rank
-    )
-    down_prezero_event = torch.cuda.Event() if down_intermediate is not None else None
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         _run_gate_up_lora()
         lora_event.record()
-        if down_intermediate is not None:
-            down_intermediate.zero_()
-            down_prezero_event.record()
 
     activation_lora_input = torch.empty(
         (hidden_states.shape[0], runner_config.top_k, inter),
@@ -389,8 +340,6 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
     # the FP4 op isn't torn down before instantiation (eager relies on deferred destroy).
     if torch.cuda.is_current_stream_capturing():
         _LORA_OVERLAP_EVENTS.append(lora_event)
-        if down_prezero_event is not None:
-            _LORA_OVERLAP_EVENTS.append(down_prezero_event)
     lora_ready_handle = lora_event.cuda_event
 
     output = trtllm_fp4_block_scale_routed_moe_lora(
@@ -424,9 +373,6 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
     )
 
     def _run_down_lora(out):
-        if down_prezero_event is not None:
-            # Join: the down shrink (first consumer) must observe the side-stream fill.
-            torch.cuda.current_stream().wait_event(down_prezero_event)
         merged_experts_fused_moe_lora_add(
             output=out,
             hidden_states=activation_lora_input.view(-1, inter),
@@ -444,7 +390,6 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
-            prezeroed_intermediate=down_intermediate,
         )
 
     _run_down_lora(output)

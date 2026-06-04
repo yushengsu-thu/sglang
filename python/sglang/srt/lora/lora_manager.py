@@ -129,7 +129,12 @@ class LoRAManager:
         init_lora_two_stream_resources(self.device)
 
     def init_cuda_graph_moe_buffers(
-        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype,
+        moe_layer,
+        num_moe_layers: int = 0,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
@@ -141,6 +146,8 @@ class LoRAManager:
             max_loras=max_loras,
             compute_dtype=compute_dtype,
             moe_layer=moe_layer,
+            num_moe_layers=num_moe_layers,
+            max_lora_rank=self.max_lora_rank,
         )
 
     def create_lora_update_result(
@@ -310,6 +317,15 @@ class LoRAManager:
         )
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        # SGLANG_OPT_LORA_MOE_PREZERO: re-zero the MoE LoRA shrink bump buffer
+        # once per forward (one fill kernel, outside any cuda graph — this hook
+        # runs on the eager, capture, and graph-replay paths alike), replacing
+        # the per-call torch.zeros before every gate_up-A / down-A split-K
+        # shrink. No-op when the buffer was never created (env off / no MoE LoRA).
+        from sglang.srt.lora.moe_lora_zero_buffer import reset_moe_lora_zero_buffer
+
+        reset_moe_lora_zero_buffer()
+
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 

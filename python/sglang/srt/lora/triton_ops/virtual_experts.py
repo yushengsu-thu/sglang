@@ -11,6 +11,7 @@ import triton.language as tl
 
 from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
 from sglang.srt.environ import envs
+from sglang.srt.lora.moe_lora_zero_buffer import take_zeroed_slice
 
 @triton.jit
 def _fused_virtual_topk_ids_kernel(
@@ -578,7 +579,6 @@ def _merged_experts_fused_moe_lora_add_impl(
     use_direct_expand_add: bool = False,
     local_expert_offset: int = 0,
     local_num_experts: int | None = None,
-    prezeroed_intermediate: torch.Tensor | None = None,
 ) -> None:
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -759,13 +759,21 @@ def _merged_experts_fused_moe_lora_add_impl(
         topk_ids.shape[1],
         max_lora_rank,
     ]
-    # NOTE: an in-function variant that zero-filled on a dedicated stream
+    # NOTE: an earlier variant zero-filled per call on a dedicated stream
     # concurrent with the routing kernels (forked before _get_routing, joined
-    # before the shrink) was bench-rejected: the cross-stream join between the
-    # align/sanitize kernels and the PDL-chained shrink cost 6-11% decode
-    # throughput on Qwen3.5-35B (bs 16-64) -- far more than the ~2us fill it
-    # hid. Only the caller-provided buffer path below is kept.
-    intermediate: torch.Tensor | None = prezeroed_intermediate
+    # before the shrink) and was bench-rejected: the per-call cross-stream
+    # fork/join (2 per MoE layer per step) cost 6-11% decode throughput on
+    # Qwen3.5-35B (bs 16-64) -- far more than the ~2us fill it hid. The
+    # bump-allocator slice below has no such sync (zeroed once per forward on
+    # the main stream, before any consumer).
+    intermediate: torch.Tensor | None = None
+    slice_flat = take_zeroed_slice(
+        intermediate_shape[0] * intermediate_shape[1] * intermediate_shape[2],
+        hidden_states.dtype,
+        hidden_states.device,
+    )
+    if slice_flat is not None:
+        intermediate = slice_flat.view(intermediate_shape)
     if intermediate is None:
         intermediate_split_k = _get_moe_lora_shrink_split_k(
             lora_a_virtual, sorted_token_ids, a_stage_config
@@ -921,16 +929,8 @@ def merged_experts_fused_moe_lora_add(
     use_direct_expand_add: bool = False,
     local_expert_offset: int = 0,
     local_num_experts: int | None = None,
-    prezeroed_intermediate: torch.Tensor | None = None,
 ) -> None:
-    """Public API: wraps the registered op with routing_cache support.
-
-    ``prezeroed_intermediate``: optional caller-provided shrink intermediate of
-    shape [num_tokens, top_k, max_lora_rank] that is ALREADY zeroed and whose
-    fill is ALREADY ordered before the current stream (event-joined). Lets call
-    sites hide the split-K zero-fill in an otherwise-idle stream window (e.g.
-    the side stream while the main stream runs the trtllm MoE op).
-    """
+    """Public API: wraps the registered op with routing_cache support."""
     _merged_experts_fused_moe_lora_add_impl(
         output,
         hidden_states,
@@ -948,5 +948,4 @@ def merged_experts_fused_moe_lora_add(
         use_direct_expand_add=use_direct_expand_add,
         local_expert_offset=local_expert_offset,
         local_num_experts=local_num_experts,
-        prezeroed_intermediate=prezeroed_intermediate,
     )
