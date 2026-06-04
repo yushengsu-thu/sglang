@@ -64,7 +64,10 @@ env-var-conventions skill）。
 ## 實作步驟
 
 - [x] Step 1: env var + C++ plumbing + Python overlap (FP8 + FP4)
-- [ ] Step 2: commit + push + 開 PR（per 用戶指示先不跑 regression/bench）
+- [x] Step 2: commit + push + 開 PR（per 用戶指示先不跑 regression/bench）
+  - commit `4883cd71b5`，branch push 到 origin（yushengsu-thu fork；jybsuper 無 push 權限）
+  - PR: https://github.com/jybsuper/sglang/pull/26 (2026-06-04 12:45)
+- [ ] （後續）compile 驗證 + Qwen/Kimi regression + perf bench（e2e + server-log decode thpt）
 
 ## 實作完成 (2026-06-04 12:40)
 
