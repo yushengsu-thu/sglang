@@ -12,6 +12,8 @@ single Triton launch. Bit-identical to the torch reference: weights are softmax/
 == torch's sign-extend-then-or); expert ids are small (< num_experts).
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -30,10 +32,22 @@ def _pack_topk_kernel(ids_ptr, w_ptr, out_ptr, numel, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, packed, mask=mask)
 
 
-def fused_pack_topk(topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
+def fused_pack_topk(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Single-launch replacement for the elementwise routed-MoE topk pack.
 
     Returns int32 ``[*, top_k]`` packed tensor, bit-identical to the torch reference.
+
+    ``out`` (optional, int32, same shape, contiguous) lets the caller pre-allocate the
+    packed buffer on its own (consumer) stream — required when this runs inside a
+    side-stream context whose output is consumed cross-stream (a buffer allocated under
+    ``with torch.cuda.stream(side)`` is side-stream-tagged, and record_stream is a no-op
+    during cuda-graph capture → premature-reuse WAR; see SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC
+    in environ.py). The dtype-cast intermediates below stay stream-local (produced and
+    consumed on the launching stream), so only ``out`` needs the caller-side allocation.
     """
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
@@ -41,7 +55,14 @@ def fused_pack_topk(topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch
     if topk_weights.dtype != torch.float32:
         topk_weights = topk_weights.to(torch.float32)
     topk_weights = topk_weights.contiguous()
-    out = torch.empty_like(topk_ids, dtype=torch.int32)
+    if out is None:
+        out = torch.empty_like(topk_ids, dtype=torch.int32)
+    else:
+        assert (
+            out.dtype == torch.int32
+            and out.shape == topk_ids.shape
+            and out.is_contiguous()
+        )
     numel = out.numel()
     if numel == 0:
         return out

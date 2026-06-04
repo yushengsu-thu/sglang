@@ -11,6 +11,7 @@ their behavior is byte-identical to the unpatched code path.
 """
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.lora.trtllm_moe import (
     get_lora_side_stream,
     get_original_fp4_moe_lora_func,
@@ -128,11 +129,37 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     # permute+GEMM1 overlap the side-stream LoRA shrink/expand instead of joining before the
     # whole op.
     lora_event = torch.cuda.Event()
+    # pack_topk two-stream (SGLANG_OPT_LORA_PACK_TOPK_TWO_STREAM, default off): the packed
+    # top-k is consumed by the op at launch (its routing), but pack_topk depends only on
+    # topk_ids/topk_weights -- independent of both the FP8 quant and the gate_up LoRA. When
+    # enabled, run it FIRST on the side stream so it overlaps the main-stream quant below and
+    # is off the main critical path (otherwise it sits serially between quant and the op). The
+    # main stream waits on pack_event right before the op; gate_up follows pack on the side
+    # stream and its lora_event is consumed much later (pre-activation), so pack's single tiny
+    # launch is absorbed. When disabled, the pack stays serial on the main stream (below).
+    _pack_two_stream = envs.SGLANG_OPT_LORA_PACK_TOPK_TWO_STREAM.get()
+    pack_event = torch.cuda.Event() if _pack_two_stream else None
+    if _pack_two_stream:
+        # Allocate the packed buffer on the MAIN (consumer) stream, like gate_up_delta: a buffer
+        # allocated inside the side-stream context is side-stream-tagged and record_stream is a
+        # no-op during cuda-graph capture -> premature-reuse WAR (see
+        # SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC in environ.py for the same hazard on the shrink path).
+        packed_topk_ids = torch.empty(
+            topk_ids.shape, dtype=torch.int32, device=topk_ids.device
+        )
 
-    # O1 fork — gate_up shrink/expand on side stream concurrent with the main-stream
-    # per-token-group FP8 quant + the trtllm op's permute+GEMM1 below.
+    # O1 fork — gate_up shrink/expand (and, when enabled, the pack) on the side stream
+    # concurrent with the main-stream per-token-group FP8 quant + the trtllm op's
+    # permute+GEMM1 below.
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
+        if _pack_two_stream:
+            _pack_topk_for_flashinfer_routed(
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                out=packed_topk_ids,
+            )
+            pack_event.record()
         _run_gate_up_lora()
         lora_event.record()
 
@@ -151,10 +178,11 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
         device=hidden_states.device,
     )
 
-    packed_topk_ids = _pack_topk_for_flashinfer_routed(
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-    )
+    if not _pack_two_stream:
+        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         direct_down_output = torch.empty(
@@ -164,11 +192,18 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
             device=hidden_states.device,
         )
 
+    if _pack_two_stream:
+        # packed_topk_ids was written on the side stream; the op reads it on the main stream at
+        # launch, so join on pack_event here (captured as a cross-stream edge under cuda graphs).
+        torch.cuda.current_stream().wait_event(pack_event)
+
     # No pre-op join: the trtllm op waits on lora_event right before its activation kernel,
-    # so permute+GEMM1 run concurrent with the side-stream LoRA. Keep the event alive through
-    # cuda-graph capture so the captured cross-stream wait isn't torn down before instantiation.
+    # so permute+GEMM1 run concurrent with the side-stream LoRA. Keep the events alive through
+    # cuda-graph capture so the captured cross-stream waits aren't torn down before instantiation.
     if torch.cuda.is_current_stream_capturing():
         _LORA_OVERLAP_EVENTS.append(lora_event)
+        if _pack_two_stream:
+            _LORA_OVERLAP_EVENTS.append(pack_event)
     lora_ready_handle = lora_event.cuda_event
 
     moe_result = trtllm_fp8_block_scale_routed_moe_lora(

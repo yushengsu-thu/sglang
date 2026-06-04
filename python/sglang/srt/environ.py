@@ -458,6 +458,14 @@ class Envs:
     # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
     # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.
     SGLANG_OPT_LORA_SHRINK_TUNE = EnvBool(False)
+    # Move the routed-topk pack off the FP8 two-stream MoE-LoRA decode critical path: run
+    # _pack_topk_for_flashinfer_routed on the LoRA side stream (ahead of the gate_up shrink/expand)
+    # concurrent with the main-stream per-token-group FP8 quant; the main stream joins on a pack
+    # event right before the trtllm op (which consumes the packed ids at launch). The packed buffer
+    # is allocated on the MAIN (consumer) stream — side-stream-tagged allocations are a premature-
+    # reuse WAR under cuda-graph replay (see SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC above). Default off
+    # keeps the proven serial pack (main stream, between quant and the op).
+    SGLANG_OPT_LORA_PACK_TOPK_TWO_STREAM = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
