@@ -12,33 +12,6 @@ import triton.language as tl
 from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
 from sglang.srt.environ import envs
 
-# --- MoE LoRA shrink-intermediate prezero (SGLANG_OPT_LORA_MOE_PREZERO) ------
-# The split-K shrink accumulates with atomic_add, so its intermediate must be
-# pre-zeroed. By default that torch.zeros fill sits right before the shrink on
-# the LoRA chain; with the env set, the fill is issued on this dedicated stream
-# concurrent with the routing/align kernels and joined via event right before
-# the shrink launch, moving it off the critical path.
-_LORA_PREZERO_STREAM: torch.cuda.Stream | None = None
-
-# Keep prezero-fill events recorded during cuda-graph capture alive so the
-# captured cross-stream wait isn't torn down before graph instantiation
-# (same idiom as moe_overlap._LORA_OVERLAP_EVENTS).
-_LORA_PREZERO_EVENTS: list = []
-
-
-def get_lora_prezero_stream() -> torch.cuda.Stream:
-    """Lazily allocate the shared MoE LoRA prezero stream.
-
-    ``torch.cuda.Stream()`` is a driver call that must not run inside a
-    cuda-graph capture region; ``init_lora_two_stream_resources`` creates it
-    eagerly pre-capture when SGLANG_OPT_LORA_MOE_PREZERO=1.
-    """
-    global _LORA_PREZERO_STREAM
-    if _LORA_PREZERO_STREAM is None:
-        _LORA_PREZERO_STREAM = torch.cuda.Stream()
-    return _LORA_PREZERO_STREAM
-
-
 @triton.jit
 def _fused_virtual_topk_ids_kernel(
     topk_ids_ptr,
@@ -769,36 +742,6 @@ def _merged_experts_fused_moe_lora_add_impl(
             "num_warps": 4,
             "num_stages": 4,
         }
-    intermediate_shape = [
-        token_lora_mapping.shape[0],
-        topk_ids.shape[1],
-        max_lora_rank,
-    ]
-    intermediate: torch.Tensor | None = prezeroed_intermediate
-    prezero_event: torch.cuda.Event | None = None
-    if intermediate is None and envs.SGLANG_OPT_LORA_MOE_PREZERO.get():
-        # Off-critical-path zero-fill: fork the prezero stream BEFORE the
-        # routing kernels below are queued, so the fill runs concurrent with
-        # virtual_topk/align/sanitize on the current stream; the join lands
-        # right before the shrink launch. Allocate on the current (consumer)
-        # stream so the caching allocator's reuse schedule follows the consumer
-        # (graph-safe; same idiom as O1's gate_up_delta). Conservatively always
-        # zero -- split-K is only known post-routing, and an unneeded fill is
-        # free here (off the critical path).
-        intermediate = torch.empty(
-            intermediate_shape,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        prezero_stream = get_lora_prezero_stream()
-        prezero_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(prezero_stream):
-            intermediate.zero_()
-            prezero_event = torch.cuda.Event()
-            prezero_event.record()
-        if torch.cuda.is_current_stream_capturing():
-            _LORA_PREZERO_EVENTS.append(prezero_event)
-
     (
         sorted_token_ids,
         expert_ids,
@@ -811,6 +754,18 @@ def _merged_experts_fused_moe_lora_add_impl(
         experts_shared_outer_loras_a,
         a_stage_config["BLOCK_SIZE_M"],
     )
+    intermediate_shape = [
+        token_lora_mapping.shape[0],
+        topk_ids.shape[1],
+        max_lora_rank,
+    ]
+    # NOTE: an in-function variant that zero-filled on a dedicated stream
+    # concurrent with the routing kernels (forked before _get_routing, joined
+    # before the shrink) was bench-rejected: the cross-stream join between the
+    # align/sanitize kernels and the PDL-chained shrink cost 6-11% decode
+    # throughput on Qwen3.5-35B (bs 16-64) -- far more than the ~2us fill it
+    # hid. Only the caller-provided buffer path below is kept.
+    intermediate: torch.Tensor | None = prezeroed_intermediate
     if intermediate is None:
         intermediate_split_k = _get_moe_lora_shrink_split_k(
             lora_a_virtual, sorted_token_ids, a_stage_config
@@ -835,10 +790,6 @@ def _merged_experts_fused_moe_lora_add_impl(
                 device=hidden_states.device,
             )
         )
-
-    if prezero_event is not None:
-        # Join: the shrink (first consumer) must observe the side-stream fill.
-        torch.cuda.current_stream().wait_event(prezero_event)
 
     _invoke_moe_lora_shrink_splitk(
         hidden_states,

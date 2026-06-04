@@ -57,26 +57,12 @@ def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> Non
     inside capture if warmup didn't happen to exercise a two-stream batch.
     Calling this from a pre-capture hook pins creation to init/warmup on the
     correct device.
-
-    Also creates the MoE LoRA prezero stream (lazy in
-    ``triton_ops.virtual_experts``) when ``SGLANG_OPT_LORA_MOE_PREZERO=1``,
-    for the same reason.
     """
-
-    def _create_streams() -> None:
-        get_lora_side_stream()
-        if envs.SGLANG_OPT_LORA_MOE_PREZERO.get():
-            from sglang.srt.lora.triton_ops.virtual_experts import (
-                get_lora_prezero_stream,
-            )
-
-            get_lora_prezero_stream()
-
     if device is not None:
         with torch.cuda.device(device):
-            _create_streams()
+            get_lora_side_stream()
     else:
-        _create_streams()
+        get_lora_side_stream()
 
 
 def lora_overlap_alloc_stream() -> Optional[torch.cuda.Stream]:
