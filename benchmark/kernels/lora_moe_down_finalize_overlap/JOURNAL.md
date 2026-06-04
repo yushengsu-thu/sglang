@@ -117,6 +117,27 @@ A/B 設計（同 commit `58ba52bcfe`，隔離 feature 本身）：
    另：driver 改 `nohup+disown` 脫離（背景 task 兩度被外部殺，macOS 無 setsid）。
 5. 15:2x 第五次 driver run 啟動（pid 94151）。
 
+## 設計改版 V2：只重疊 gemm A（shrink） (2026-06-04 15:40)
+
+用戶指示（15:35）：改成只重疊 finalize 與 gemm-A，**不重疊 gemm-B**，保險起見
+（避免 finalize 和 gemm-B 同時寫 output、finalize 覆蓋 lora 貢獻的風險類）。
+
+V1（delta buffer + post-finalize add）已經避開了寫衝突，但 V2 更保守且更乾淨：
+- side stream 在 gemm2_done 之後只跑 **routing prep + shrink（gemm A）**，寫進
+  main-stream 預分配的 `down_intermediate`（consumer-stream alloc，遵守
+  OVERLAP_MAIN_ALLOC 教訓）；shrink 階段順便 pre-warm routing-B cache（這些 routing
+  小 kernel 也一起藏進 finalize）
+- main stream 在 op 之後（= finalize 之後）wait shrink_done → **expand-add（gemm B）
+  照原樣在 main stream 上 atomic 進 output** —— 與 serial 路徑同 kernel 同 buffer，
+  **數值 bitwise 一致**（V1 有一次額外 bf16 rounding，V2 沒有）
+- 移除 down_delta buffer / zero / `output += delta`，省 2 個 kernel
+- C++（gemm2_done_event plumbing）不變
+
+實作：`virtual_experts.py` 的 `_merged_experts_fused_moe_lora_add_impl` 加
+`stage`（"all"/"shrink"/"expand"）+ `intermediate_buffer` 參數——"all" 預設路徑行為
+不變（gate_up 等其他 caller 不受影響）；moe_overlap.py 兩路徑改用兩段式呼叫。
+舊版 V1 驗證 run 已停掉，將以 V2 commit 重新驗證。
+
 ## 實作完成 (2026-06-04 12:40)
 
 改動（6 檔，+144/-31）：
