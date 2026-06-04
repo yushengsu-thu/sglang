@@ -579,12 +579,21 @@ def _merged_experts_fused_moe_lora_add_impl(
     use_direct_expand_add: bool = False,
     local_expert_offset: int = 0,
     local_num_experts: int | None = None,
-) -> None:
+    shrink_only: bool = False,
+    precomputed_intermediate: torch.Tensor | None = None,
+) -> torch.Tensor | None:
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
     2. Flatten LoRA weights from [max_loras, num_experts, ...] to [max_loras * num_experts, ...].
     3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
     4. Mask out tokens with token_lora_mapping == -1 on the add path.
+
+    Two-phase split (SGLANG_OPT_LORA_MOE_EARLY_SHRINK): ``shrink_only=True`` runs only the
+    small pre-expand kernels — A-stage routing (virtual-topk / align / sanitize), the split-K
+    shrink, and the B-stage routing (prefilled into ``routing_cache``) — and returns the
+    shrink ``intermediate``. A second call with ``precomputed_intermediate`` set skips all of
+    that (B routing hits the cache) and launches just the LoRA-B expand. Both default to the
+    single-call behavior.
 
     EP: when `local_num_experts` (< global) is given, this rank only computes the
     delta for the experts it owns. We keep the GLOBAL expert ids + global contiguous
@@ -731,71 +740,86 @@ def _merged_experts_fused_moe_lora_add_impl(
     num_experts_a = lora_a.shape[1]
     num_experts_b = lora_b.shape[1]
 
-    a_stage_config = _get_stage_config(lora_a_virtual, input_top_k)
-    if envs.SGLANG_OPT_LORA_SHRINK_TUNE.get():
-        # Tuned decode shrink config: skinny GEMM (M=tokens small, N=rank, K=in large).
-        a_stage_config = {
-            **a_stage_config,
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": max_lora_rank,
-            "BLOCK_SIZE_K": 256,
-            "num_warps": 4,
-            "num_stages": 4,
-        }
-    (
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        token_lora_mask,
-    ) = _get_routing(
-        topk_ids,
-        token_lora_mapping,
-        num_experts_a,
-        experts_shared_outer_loras_a,
-        a_stage_config["BLOCK_SIZE_M"],
-    )
-    intermediate_shape = [
-        token_lora_mapping.shape[0],
-        topk_ids.shape[1],
-        max_lora_rank,
-    ]
-    intermediate_split_k = _get_moe_lora_shrink_split_k(
-        lora_a_virtual, sorted_token_ids, a_stage_config
-    )
-    # EP leaves non-owned [token, k] shrink slots unwritten. A per-expert expand skips
-    # non-owned blocks (never reads them), but a shared-outer expand routes by lora id
-    # and would read them into the real (all-reduced) output -> must zero. split_k > 1
-    # also needs a zeroed buffer for its accumulation.
-    zero_intermediate = intermediate_split_k > 1 or (
-        ep_local and experts_shared_outer_loras_b
-    )
-    intermediate = (
-        torch.zeros(
-            intermediate_shape,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+    if precomputed_intermediate is None:
+        a_stage_config = _get_stage_config(lora_a_virtual, input_top_k)
+        if envs.SGLANG_OPT_LORA_SHRINK_TUNE.get():
+            # Tuned decode shrink config: skinny GEMM (M=tokens small, N=rank, K=in large).
+            a_stage_config = {
+                **a_stage_config,
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": max_lora_rank,
+                "BLOCK_SIZE_K": 256,
+                "num_warps": 4,
+                "num_stages": 4,
+            }
+        (
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            token_lora_mask,
+        ) = _get_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_experts_a,
+            experts_shared_outer_loras_a,
+            a_stage_config["BLOCK_SIZE_M"],
         )
-        if zero_intermediate
-        else torch.empty(
-            intermediate_shape,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        intermediate_shape = [
+            token_lora_mapping.shape[0],
+            topk_ids.shape[1],
+            max_lora_rank,
+        ]
+        intermediate_split_k = _get_moe_lora_shrink_split_k(
+            lora_a_virtual, sorted_token_ids, a_stage_config
         )
-    )
+        # EP leaves non-owned [token, k] shrink slots unwritten. A per-expert expand skips
+        # non-owned blocks (never reads them), but a shared-outer expand routes by lora id
+        # and would read them into the real (all-reduced) output -> must zero. split_k > 1
+        # also needs a zeroed buffer for its accumulation.
+        zero_intermediate = intermediate_split_k > 1 or (
+            ep_local and experts_shared_outer_loras_b
+        )
+        intermediate = (
+            torch.zeros(
+                intermediate_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            if zero_intermediate
+            else torch.empty(
+                intermediate_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        )
 
-    _invoke_moe_lora_shrink_splitk(
-        hidden_states,
-        lora_a_virtual,
-        intermediate.view(-1, max_lora_rank),
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        input_top_k,
-        a_stage_config,
-    )
+        _invoke_moe_lora_shrink_splitk(
+            hidden_states,
+            lora_a_virtual,
+            intermediate.view(-1, max_lora_rank),
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            input_top_k,
+            a_stage_config,
+        )
+    else:
+        intermediate = precomputed_intermediate
 
     b_stage_config = _get_stage_config(lora_b_virtual, 1)
+    if shrink_only:
+        # Prefill the B-stage routing into routing_cache so the expand-phase call's
+        # _get_routing is a pure cache hit — every small kernel (routing + shrink)
+        # runs in this early phase; the expand phase launches only the expand itself.
+        _get_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_experts_b,
+            experts_shared_outer_loras_b,
+            b_stage_config["BLOCK_SIZE_M"],
+        )
+        return intermediate
     (
         sorted_token_ids,
         expert_ids,
@@ -913,9 +937,16 @@ def merged_experts_fused_moe_lora_add(
     use_direct_expand_add: bool = False,
     local_expert_offset: int = 0,
     local_num_experts: int | None = None,
-) -> None:
-    """Public API: wraps the registered op with routing_cache support."""
-    _merged_experts_fused_moe_lora_add_impl(
+    shrink_only: bool = False,
+    precomputed_intermediate: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Public API: wraps the registered op with routing_cache support.
+
+    ``shrink_only=True`` returns the shrink intermediate (routing prefilled into
+    ``routing_cache``); pass it back via ``precomputed_intermediate`` to launch
+    just the expand. See ``_merged_experts_fused_moe_lora_add_impl``.
+    """
+    return _merged_experts_fused_moe_lora_add_impl(
         output,
         hidden_states,
         lora_a,
@@ -932,4 +963,6 @@ def merged_experts_fused_moe_lora_add(
         use_direct_expand_add=use_direct_expand_add,
         local_expert_offset=local_expert_offset,
         local_num_experts=local_num_experts,
+        shrink_only=shrink_only,
+        precomputed_intermediate=precomputed_intermediate,
     )

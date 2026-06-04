@@ -458,6 +458,14 @@ class Envs:
     # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
     # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.
     SGLANG_OPT_LORA_SHRINK_TUNE = EnvBool(False)
+    # Two-stream MoE LoRA (O1): pull the small gate_up LoRA pre-expand kernels (virtual-topk routing,
+    # moe_align, sanitize, split-K shrink) forward so they overlap the main-stream per-token-group quant
+    # window right after topk gating, instead of drifting to just before the trtllm op's activation where
+    # they contend with the gate_up base GEMM for SMs. Adds a main-stream wait on a shrink-done event
+    # right before the trtllm op launch, structurally guaranteeing the small kernels never overlap the
+    # base GEMM. The LoRA-B expand-add keeps its exact graph position (still joined via lora_ready_event
+    # before activation). Default off (experimental).
+    SGLANG_OPT_LORA_MOE_EARLY_SHRINK = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

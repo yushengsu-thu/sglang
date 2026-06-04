@@ -11,6 +11,7 @@ their behavior is byte-identical to the unpatched code path.
 """
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.lora.trtllm_moe import (
     get_lora_side_stream,
     get_original_fp4_moe_lora_func,
@@ -104,8 +105,8 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     )
     gate_up_delta = hidden_states.new_empty(gate_up_delta_shape)
 
-    def _run_gate_up_lora():
-        merged_experts_fused_moe_lora_add(
+    def _run_gate_up_lora(shrink_only=False, precomputed_intermediate=None):
+        return merged_experts_fused_moe_lora_add(
             output=gate_up_delta,
             hidden_states=hidden_states,
             lora_a=lora_info.gate_up_lora_a_weights,
@@ -121,6 +122,8 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
+            shrink_only=shrink_only,
+            precomputed_intermediate=precomputed_intermediate,
         )
 
     # GEMM1-LoRA overlap: fire the gate_up LoRA on the side stream + record an event; the
@@ -128,12 +131,25 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     # permute+GEMM1 overlap the side-stream LoRA shrink/expand instead of joining before the
     # whole op.
     lora_event = torch.cuda.Event()
+    # Early-shrink (SGLANG_OPT_LORA_MOE_EARLY_SHRINK): split the side-stream chain so the
+    # small pre-expand kernels (virtual-topk routing / align / sanitize / split-K shrink)
+    # get a hard shrink_done -> op edge below, pinning them into the quant window instead
+    # of letting the replay scheduler drift them onto the gate_up base GEMM.
+    early_shrink = envs.SGLANG_OPT_LORA_MOE_EARLY_SHRINK.get()
+    shrink_done_event = torch.cuda.Event() if early_shrink else None
 
     # O1 fork — gate_up shrink/expand on side stream concurrent with the main-stream
     # per-token-group FP8 quant + the trtllm op's permute+GEMM1 below.
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
-        _run_gate_up_lora()
+        if early_shrink:
+            gate_up_shrink_intermediate = _run_gate_up_lora(shrink_only=True)
+            shrink_done_event.record()
+            # Expand-add keeps its exact graph position (same stream, same predecessors,
+            # still joined via lora_ready_event before the op's activation).
+            _run_gate_up_lora(precomputed_intermediate=gate_up_shrink_intermediate)
+        else:
+            _run_gate_up_lora()
         lora_event.record()
 
     # Fuse the per-token scale transpose into the quant kernel: column-major scales make
@@ -170,6 +186,14 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     if torch.cuda.is_current_stream_capturing():
         _LORA_OVERLAP_EVENTS.append(lora_event)
     lora_ready_handle = lora_event.cuda_event
+
+    if early_shrink:
+        # Hard edge: the small pre-expand LoRA kernels must finish before the trtllm op
+        # (routing + gate_up base GEMM) starts — they overlap only the quant/pack window
+        # above and never contend with the base GEMM for SMs.
+        torch.cuda.current_stream().wait_event(shrink_done_event)
+        if torch.cuda.is_current_stream_capturing():
+            _LORA_OVERLAP_EVENTS.append(shrink_done_event)
 
     moe_result = trtllm_fp8_block_scale_routed_moe_lora(
         topk_ids=packed_topk_ids,
@@ -291,8 +315,8 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
         (hidden_states.shape[0], runner_config.top_k, quant_info.w13_weight.shape[1])
     )
 
-    def _run_gate_up_lora():
-        merged_experts_fused_moe_lora_add(
+    def _run_gate_up_lora(shrink_only=False, precomputed_intermediate=None):
+        return merged_experts_fused_moe_lora_add(
             output=gate_up_delta,
             hidden_states=hidden_states,
             lora_a=lora_info.gate_up_lora_a_weights,
@@ -308,15 +332,27 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
+            shrink_only=shrink_only,
+            precomputed_intermediate=precomputed_intermediate,
         )
 
     # O1-fp4 fork: gate_up shrink/expand on the side stream, concurrent with the
     # FP4 op's permute + gate_up GEMM1 below. The op waits on lora_event right
     # before its activation kernel (the only consumer of gate_up_delta).
     lora_event = torch.cuda.Event()
+    # Early-shrink (SGLANG_OPT_LORA_MOE_EARLY_SHRINK): same split as the FP8 path —
+    # small pre-expand kernels get a hard shrink_done -> op edge so they never drift
+    # onto the gate_up base GEMM; the expand-add keeps its exact graph position.
+    early_shrink = envs.SGLANG_OPT_LORA_MOE_EARLY_SHRINK.get()
+    shrink_done_event = torch.cuda.Event() if early_shrink else None
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
-        _run_gate_up_lora()
+        if early_shrink:
+            gate_up_shrink_intermediate = _run_gate_up_lora(shrink_only=True)
+            shrink_done_event.record()
+            _run_gate_up_lora(precomputed_intermediate=gate_up_shrink_intermediate)
+        else:
+            _run_gate_up_lora()
         lora_event.record()
 
     activation_lora_input = torch.empty(
@@ -341,6 +377,13 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
     if torch.cuda.is_current_stream_capturing():
         _LORA_OVERLAP_EVENTS.append(lora_event)
     lora_ready_handle = lora_event.cuda_event
+
+    if early_shrink:
+        # Hard edge: small pre-expand LoRA kernels finish before the FP4 op (routing +
+        # gate_up base GEMM) starts — overlap only the pack window, never the base GEMM.
+        torch.cuda.current_stream().wait_event(shrink_done_event)
+        if torch.cuda.is_current_stream_capturing():
+            _LORA_OVERLAP_EVENTS.append(shrink_done_event)
 
     output = trtllm_fp4_block_scale_routed_moe_lora(
         topk_ids=packed_topk_ids,
