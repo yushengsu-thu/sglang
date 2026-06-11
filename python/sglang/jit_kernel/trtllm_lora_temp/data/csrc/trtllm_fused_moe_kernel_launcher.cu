@@ -4153,6 +4153,58 @@ Array<int64_t> sgl_trtllm_fp4_probe_unfused(
       probe(ActivationType::Relu2, false)};
 }
 
+// opt7-step0: bf16 analogue of sgl_trtllm_fp4_probe_unfused. Decides the in-MoE fold route:
+// if the unfused-activation gated GEMM1 cubin exists for Bfloat16 ([1] or [2] > 0), route (a)
+// is just wiring; if -1/0 (the expected "missing-unfused-cubin wall", same as NVFP4), the fold
+// must be route (b): a new CUTLASS grouped GEMM with gather-prologue + SwiGLU-LoRA EVT epilogue.
+Array<int64_t> sgl_trtllm_bf16_probe_unfused(
+    int64_t top_k,
+    int64_t hidden_size,
+    int64_t intermediate_size,
+    int64_t num_local_experts,
+    int64_t num_tokens,
+    int64_t tile_n) {
+  using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+  using ActivationType = tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
+  // Probe variants:
+  //   [0] Swiglu fused, BlockMajorK   (the normal no-LoRA bf16 path) -> sanity, expect >0
+  //   [1] Swiglu unfused, BlockMajorK (fusedAct=false gated GEMM1)   -> the route-(a) question
+  //   [2] Swiglu unfused, MajorK      (in case it only exists in FP4's weight layout)
+  //   [3] Identity non-gated, BlockMajorK (plain route-act GEMM1, raw 2*inter output)
+  auto probe = [&](ActivationType act, bool unfuse, batchedGemm::gemm::MatrixLayout layout) -> int64_t {
+    try {
+      RunnerType r(
+          btg::Dtype::Bfloat16,
+          btg::Dtype::Bfloat16,
+          /*useDeepSeekFp8=*/false,
+          static_cast<int>(tile_n),
+          act,
+          /*useShuffledMatrix=*/true,
+          layout,
+          /*usePerTokenScalingGemm1=*/false,
+          /*usePerTokenScalingGemm2=*/false,
+          /*usePerChannelScalingGemm1=*/false,
+          /*usePerChannelScalingGemm2=*/false,
+          /*unfuseActForLora=*/unfuse);
+      auto cfgs = r.getValidConfigIndices(
+          static_cast<int32_t>(top_k),
+          static_cast<int32_t>(hidden_size),
+          static_cast<int32_t>(intermediate_size),
+          static_cast<int32_t>(num_local_experts),
+          static_cast<int32_t>(num_tokens));
+      return static_cast<int64_t>(cfgs.size());
+    } catch (...) {
+      return -1;
+    }
+  };
+  using ML = batchedGemm::gemm::MatrixLayout;
+  return {
+      probe(ActivationType::Swiglu, false, ML::BlockMajorK),
+      probe(ActivationType::Swiglu, true, ML::BlockMajorK),
+      probe(ActivationType::Swiglu, true, ML::MajorK),
+      probe(ActivationType::Identity, false, ML::BlockMajorK)};
+}
+
 // Evaluate Solution 1: use the non-gated routeAct=false GEMM2-style batched GEMM as the gate_up
 // (GEMM1) projection. Returns [num_passing_cubins, num_valid_for_dims] for an E2m1->bf16 Gemm2
 // runner at the requested (output=out_dim, K=k_dim) shape. A positive valid count means the
@@ -4382,6 +4434,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_block_scale_moe_lora, sgl_trtllm_fp
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     sgl_trtllm_fp4_block_scale_moe_lora_finalize, sgl_trtllm_fp4_block_scale_moe_lora_finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_probe_unfused, sgl_trtllm_fp4_probe_unfused);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_bf16_probe_unfused, sgl_trtllm_bf16_probe_unfused);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_probe_gemm2, sgl_trtllm_fp4_probe_gemm2);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_permute, bench_permute);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_nvfp4_quant, bench_nvfp4_quant);
