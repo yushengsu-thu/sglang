@@ -123,7 +123,7 @@ __global__ void buildGroupArgsKernel(
 
 // ---- P2: fold-epilogue GEMM (same mainloop, half-width D + SwiGLU/LoRA fold) ----
 using FoldEpilogue = sgl_bf16_fold::Sm100BF16FoldArrayEpilogue<
-    TileShape, ElementAcc, ElementD, StrideD, typename CollectiveEpilogue::CopyOpT2R>;
+    TileShape, ElementAcc, ElementD, StrideD*, typename CollectiveEpilogue::CopyOpT2R>;
 using GemmKernelFold = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, FoldEpilogue>;
 using GemmFold = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelFold>;
 

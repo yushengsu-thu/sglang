@@ -22,6 +22,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/dispatch_policy.hpp>
+#include <cutlass/epilogue/thread/linear_combination.h>
 
 namespace sgl_bf16_fold {
 
@@ -38,6 +39,10 @@ template <
 class Sm100BF16FoldArrayEpilogue {
  public:
   using DispatchPolicy = cutlass::epilogue::Sm100PtrArrayNoSmem;
+  // Nominal thread op: satisfies GemmUniversalAdapter's type queries; the actual math is
+  // the fold below (this op is never invoked).
+  using ThreadEpilogueOp =
+      cutlass::epilogue::thread::LinearCombination<ElementD_, 1, ElementAccumulator_, float>;
   using CtaTileShapeMNK = CtaTileShapeMNK_;
   using ElementAccumulator = ElementAccumulator_;
   using ElementCompute = float;
