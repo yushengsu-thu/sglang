@@ -65,7 +65,7 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     ElementAcc, ElementAcc,
     void, LayoutD*, AlignD,           // no C source (beta = 0)
     ElementD, LayoutD*, AlignD,
-    cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;
+    cutlass::epilogue::PtrArrayNoSmemWarpSpecialized2Sm>::CollectiveOp;  // P2 base: simple TMEM->reg->gmem epilogue (the one we fork for the fold)
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OpClass,
