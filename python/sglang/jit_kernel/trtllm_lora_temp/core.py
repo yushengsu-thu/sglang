@@ -421,6 +421,21 @@ def bf16_moe_gemm1_fold_ref(
     return activated_out
 
 
+def bf16_moe_gemm1_grouped(
+    permuted_hidden: torch.Tensor,        # [R_padded, K] bf16 (tile-padded expert segments)
+    w_fold: torch.Tensor,                 # [E, N=2I, K] bf16
+    num_tokens_per_expert: torch.Tensor,  # [E] int32 (real counts)
+    tile: int,
+    gate_up_out: torch.Tensor,            # [R_padded, N] bf16 (output)
+) -> torch.Tensor:
+    """opt7 P1: CUTLASS Sm100 grouped gate_up GEMM (plain epilogue, pre-permuted A).
+    Parity-gate candidate vs the tuned bmm_Bfloat16 cubin; not a serving path yet."""
+    get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_moe_gemm1_grouped(
+        permuted_hidden, w_fold, num_tokens_per_expert, tile, gate_up_out
+    )
+    return gate_up_out
+
+
 def trtllm_fp4_block_scale_routed_moe_lora(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
