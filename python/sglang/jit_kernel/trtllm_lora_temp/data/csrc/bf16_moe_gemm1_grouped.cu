@@ -15,9 +15,10 @@
 // CUTLASS 4.x Sm100 ptr-array (grouped) GEMM via CollectiveBuilder; problem shapes, per-group
 // pointers and strides are built on-device from num_tokens_per_expert (one tiny kernel).
 
-// CUTLASS/CuTe headers MUST precede tvm_ffi_utils.h: the latter injects an unqualified
-// `Tensor` (tvm::ffi::Tensor) into the global namespace, which makes the unqualified
-// `Tensor` inside CUTLASS epilogue headers ambiguous vs cute::Tensor if parsed after it.
+// This TU is deliberately FREE of tvm-ffi headers: tvm_ffi_utils.h injects an unqualified
+// `Tensor` into the global namespace which makes the unqualified `Tensor` inside CUTLASS
+// epilogue headers ambiguous vs cute::Tensor at template-instantiation time. The FFI layer
+// lives in bf16_moe_gemm1_grouped_ffi.cu and calls run_grouped() below.
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
@@ -27,13 +28,8 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
-#include "tvm_ffi_utils.h"
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-
-using tvm::ffi::Array;
-using tvm::ffi::Optional;
 
 namespace sgl_bf16_fold_p1 {
 
@@ -120,79 +116,47 @@ __global__ void buildGroupArgsKernel(
   }
 }
 
-}  // namespace sgl_bf16_fold_p1
-
-// FFI: grouped gate_up GEMM over tile-padded permuted A.
-//   permuted_hidden [R_padded, K] bf16, w_fold [E, N, K] bf16, num_tokens_per_expert [E] i32,
-//   gate_up_out [R_padded, N] bf16 (written; padding rows = garbage, same as today's contract).
-void sgl_bf16_moe_gemm1_grouped(
-    TensorView permuted_hidden,
-    TensorView w_fold,
-    TensorView num_tokens_per_expert,
-    int64_t tile,
-    TensorView gate_up_out) {
-  namespace p1 = sgl_bf16_fold_p1;
-  TVM_FFI_ICHECK_EQ(permuted_hidden.dtype(), dl_bfloat16);
-  TVM_FFI_ICHECK_EQ(w_fold.dtype(), dl_bfloat16);
-  TVM_FFI_ICHECK_EQ(gate_up_out.dtype(), dl_bfloat16);
-  TVM_FFI_ICHECK_EQ(num_tokens_per_expert.dtype(), dl_int32);
-  TVM_FFI_ICHECK(permuted_hidden.ndim() == 2 && w_fold.ndim() == 3 && gate_up_out.ndim() == 2);
-  TVM_FFI_ICHECK(permuted_hidden.IsContiguous() && w_fold.IsContiguous() && gate_up_out.IsContiguous());
-  int const E = static_cast<int>(w_fold.size(0));
-  int const N = static_cast<int>(w_fold.size(1));
-  int const K = static_cast<int>(w_fold.size(2));
-  TVM_FFI_ICHECK_EQ(permuted_hidden.size(1), K);
-  TVM_FFI_ICHECK_EQ(gate_up_out.size(1), N);
-  TVM_FFI_ICHECK_EQ(gate_up_out.size(0), permuted_hidden.size(0));
-  TVM_FFI_ICHECK_EQ(num_tokens_per_expert.numel(), E);
-
-  auto device = permuted_hidden.device();
-  cudaStream_t stream = get_stream(device);
-
-  // Device scratch for per-group args (alignment-safe single buffer).
-  size_t const bytes_shapes = sizeof(p1::UnderlyingShape) * E;
-  size_t const bytes_ptr = sizeof(void*) * E;
-  size_t const bytes_sA = sizeof(p1::StrideA) * E;
-  size_t const bytes_sB = sizeof(p1::StrideB) * E;
-  size_t const bytes_sD = sizeof(p1::StrideD) * E;
+// Plain C++ entry point (called from bf16_moe_gemm1_grouped_ffi.cu). Returns nullptr on
+// success or a static error string. Owns its scratch/workspace via stream-ordered allocs.
+char const* run_grouped(
+    void const* permuted_hidden,
+    void const* w_fold,
+    int const* num_tokens_per_expert,
+    int E,
+    int N,
+    int K,
+    int tile,
+    void* gate_up_out,
+    cudaStream_t stream) {
+  // Device scratch for per-group args (single stream-ordered alloc, 16B-aligned slots).
   auto align16 = [](size_t x) { return (x + 15) & ~size_t(15); };
   size_t off0 = 0;
-  size_t const o_shapes = off0; off0 += align16(bytes_shapes);
-  size_t const o_pa = off0; off0 += align16(bytes_ptr);
-  size_t const o_pb = off0; off0 += align16(bytes_ptr);
-  size_t const o_pd = off0; off0 += align16(bytes_ptr);
-  size_t const o_sa = off0; off0 += align16(bytes_sA);
-  size_t const o_sb = off0; off0 += align16(bytes_sB);
-  size_t const o_sd = off0; off0 += align16(bytes_sD);
-  Tensor scratch = alloc_tensor({(int64_t)off0}, dl_int8, device);
-  char* base = static_cast<char*>(scratch.data_ptr());
+  size_t const o_shapes = off0; off0 += align16(sizeof(UnderlyingShape) * E);
+  size_t const o_pa = off0; off0 += align16(sizeof(void*) * E);
+  size_t const o_pb = off0; off0 += align16(sizeof(void*) * E);
+  size_t const o_pd = off0; off0 += align16(sizeof(void*) * E);
+  size_t const o_sa = off0; off0 += align16(sizeof(StrideA) * E);
+  size_t const o_sb = off0; off0 += align16(sizeof(StrideB) * E);
+  size_t const o_sd = off0; off0 += align16(sizeof(StrideD) * E);
+  char* base = nullptr;
+  if (cudaMallocAsync(&base, off0, stream) != cudaSuccess) return "scratch alloc failed";
 
-  auto* shapes = reinterpret_cast<p1::UnderlyingShape*>(base + o_shapes);
-  auto* ptrA = reinterpret_cast<p1::ElementA const**>(base + o_pa);
-  auto* ptrB = reinterpret_cast<p1::ElementB const**>(base + o_pb);
-  auto* ptrD = reinterpret_cast<p1::ElementD**>(base + o_pd);
-  auto* sA = reinterpret_cast<p1::StrideA*>(base + o_sa);
-  auto* sB = reinterpret_cast<p1::StrideB*>(base + o_sb);
-  auto* sD = reinterpret_cast<p1::StrideD*>(base + o_sd);
+  auto* shapes = reinterpret_cast<UnderlyingShape*>(base + o_shapes);
+  auto* ptrA = reinterpret_cast<ElementA const**>(base + o_pa);
+  auto* ptrB = reinterpret_cast<ElementB const**>(base + o_pb);
+  auto* ptrD = reinterpret_cast<ElementD**>(base + o_pd);
+  auto* sA = reinterpret_cast<StrideA*>(base + o_sa);
+  auto* sB = reinterpret_cast<StrideB*>(base + o_sb);
+  auto* sD = reinterpret_cast<StrideD*>(base + o_sd);
 
-  p1::buildGroupArgsKernel<<<1, 32, 0, stream>>>(
-      static_cast<int const*>(num_tokens_per_expert.data_ptr()),
-      E,
-      static_cast<int>(tile),
-      N,
-      K,
-      static_cast<p1::ElementA const*>(permuted_hidden.data_ptr()),
-      static_cast<p1::ElementB const*>(w_fold.data_ptr()),
-      static_cast<p1::ElementD*>(gate_up_out.data_ptr()),
-      shapes,
-      ptrA,
-      ptrB,
-      ptrD,
-      sA,
-      sB,
-      sD);
+  buildGroupArgsKernel<<<1, 32, 0, stream>>>(
+      num_tokens_per_expert, E, tile, N, K,
+      static_cast<ElementA const*>(permuted_hidden),
+      static_cast<ElementB const*>(w_fold),
+      static_cast<ElementD*>(gate_up_out),
+      shapes, ptrA, ptrB, ptrD, sA, sB, sD);
 
-  typename p1::Gemm::Arguments args{
+  typename Gemm::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {E, shapes, /*host_problem_shapes=*/nullptr},
       {ptrA, sA, ptrB, sB},
@@ -201,18 +165,29 @@ void sgl_bf16_moe_gemm1_grouped(
   args.epilogue.thread.alpha = 1.0f;
   args.epilogue.thread.beta = 0.0f;
 
-  p1::Gemm gemm;
-  size_t ws_size = p1::Gemm::get_workspace_size(args);
-  Tensor ws = alloc_tensor({(int64_t)std::max<size_t>(ws_size, 16)}, dl_int8, device);
+  Gemm gemm;
+  size_t ws_size = Gemm::get_workspace_size(args);
+  void* ws = nullptr;
+  if (ws_size > 0 && cudaMallocAsync(&ws, ws_size, stream) != cudaSuccess) {
+    cudaFreeAsync(base, stream);
+    return "workspace alloc failed";
+  }
+  char const* err = nullptr;
   auto status = gemm.can_implement(args);
-  TVM_FFI_ICHECK(status == cutlass::Status::kSuccess)
-      << "bf16 grouped GEMM can_implement failed: " << cutlass::cutlassGetStatusString(status);
-  status = gemm.initialize(args, ws.data_ptr(), stream);
-  TVM_FFI_ICHECK(status == cutlass::Status::kSuccess)
-      << "bf16 grouped GEMM initialize failed: " << cutlass::cutlassGetStatusString(status);
-  status = gemm.run(stream);
-  TVM_FFI_ICHECK(status == cutlass::Status::kSuccess)
-      << "bf16 grouped GEMM run failed: " << cutlass::cutlassGetStatusString(status);
+  if (status != cutlass::Status::kSuccess) {
+    err = cutlass::cutlassGetStatusString(status);
+  } else {
+    status = gemm.initialize(args, ws, stream);
+    if (status != cutlass::Status::kSuccess) {
+      err = cutlass::cutlassGetStatusString(status);
+    } else {
+      status = gemm.run(stream);
+      if (status != cutlass::Status::kSuccess) err = cutlass::cutlassGetStatusString(status);
+    }
+  }
+  if (ws != nullptr) cudaFreeAsync(ws, stream);
+  cudaFreeAsync(base, stream);
+  return err;
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_bf16_moe_gemm1_grouped, sgl_bf16_moe_gemm1_grouped);
+}  // namespace sgl_bf16_fold_p1
