@@ -52,8 +52,8 @@ constexpr int AlignA = 8, AlignB = 8, AlignD = 8;
 
 using ArchTag = cutlass::arch::Sm100;  // mainloop builder rejects Sm103 for dense ptr-array; sm_103a device guards mostly alias SM100 features
 using OpClass = cutlass::arch::OpClassTensorOp;
-using TileShape = Shape<_128, _128, _64>;      // first cut; tuned later against the parity gate
-using ClusterShape = Shape<_1, _1, _1>;
+using TileShape = Shape<_256, _128, _64>;      // 2SM UMMA: cluster-wide MMA tile (128/SM)
+using ClusterShape = Shape<_2, _1, _1>;
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
@@ -65,7 +65,7 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     ElementAcc, ElementAcc,
     void, LayoutD*, AlignD,           // no C source (beta = 0)
     ElementD, LayoutD*, AlignD,
-    cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>::CollectiveOp;
+    cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OpClass,
@@ -75,7 +75,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100>::CollectiveOp;
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100>::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
