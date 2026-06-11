@@ -15,11 +15,9 @@
 // CUTLASS 4.x Sm100 ptr-array (grouped) GEMM via CollectiveBuilder; problem shapes, per-group
 // pointers and strides are built on-device from num_tokens_per_expert (one tiny kernel).
 
-#include "tvm_ffi_utils.h"
-
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
+// CUTLASS/CuTe headers MUST precede tvm_ffi_utils.h: the latter injects an unqualified
+// `Tensor` (tvm::ffi::Tensor) into the global namespace, which makes the unqualified
+// `Tensor` inside CUTLASS epilogue headers ambiguous vs cute::Tensor if parsed after it.
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
@@ -27,6 +25,12 @@
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/gemm/group_array_problem_shape.hpp>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/util/packed_stride.hpp>
+
+#include "tvm_ffi_utils.h"
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
