@@ -26,6 +26,7 @@
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/gemm/group_array_problem_shape.hpp>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/kernel_hardware_info.h>
 #include <cutlass/util/packed_stride.hpp>
 
 #include <cuda_bf16.h>
@@ -158,11 +159,19 @@ char const* run_grouped(
       static_cast<ElementD*>(gate_up_out),
       shapes, ptrA, ptrB, ptrD, sA, sB, sD);
 
+  // Persistent ptr-array scheduler sizes its grid from hw_info.sm_count — leaving it
+  // unset (0) makes run() fail with kErrorInternal before any CUDA call.
+  cutlass::KernelHardwareInfo hw_info;
+  cudaGetDevice(&hw_info.device_id);
+  hw_info.sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
   typename Gemm::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {E, shapes, /*host_problem_shapes=*/nullptr},
       {ptrA, sA, ptrB, sB},
       {{}, /*ptr_C=*/nullptr, sD, ptrD, sD},
+      hw_info,
   };
   args.epilogue.thread.alpha = 1.0f;
   args.epilogue.thread.beta = 0.0f;
