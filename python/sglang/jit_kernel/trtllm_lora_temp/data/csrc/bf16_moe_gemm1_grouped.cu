@@ -31,6 +31,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdio>
+
 namespace sgl_bf16_fold_p1 {
 
 using namespace cute;
@@ -172,17 +174,30 @@ char const* run_grouped(
     cudaFreeAsync(base, stream);
     return "workspace alloc failed";
   }
+  static thread_local char errbuf[256];
   char const* err = nullptr;
-  auto status = gemm.can_implement(args);
-  if (status != cutlass::Status::kSuccess) {
-    err = cutlass::cutlassGetStatusString(status);
-  } else {
-    status = gemm.initialize(args, ws, stream);
+  cudaError_t cerr = cudaGetLastError();
+  if (cerr != cudaSuccess) {
+    snprintf(errbuf, sizeof(errbuf), "pre-existing cuda error: %s", cudaGetErrorString(cerr));
+    err = errbuf;
+  }
+  if (err == nullptr) {
+    auto status = gemm.can_implement(args);
     if (status != cutlass::Status::kSuccess) {
-      err = cutlass::cutlassGetStatusString(status);
+      snprintf(errbuf, sizeof(errbuf), "can_implement: %s", cutlass::cutlassGetStatusString(status));
+      err = errbuf;
     } else {
-      status = gemm.run(stream);
-      if (status != cutlass::Status::kSuccess) err = cutlass::cutlassGetStatusString(status);
+      status = gemm.initialize(args, ws, stream);
+      if (status != cutlass::Status::kSuccess) {
+        snprintf(errbuf, sizeof(errbuf), "initialize: %s", cutlass::cutlassGetStatusString(status));
+        err = errbuf;
+      } else {
+        status = gemm.run(stream);
+        if (status != cutlass::Status::kSuccess) {
+          snprintf(errbuf, sizeof(errbuf), "run: %s", cutlass::cutlassGetStatusString(status));
+          err = errbuf;
+        }
+      }
     }
   }
   if (ws != nullptr) cudaFreeAsync(ws, stream);
