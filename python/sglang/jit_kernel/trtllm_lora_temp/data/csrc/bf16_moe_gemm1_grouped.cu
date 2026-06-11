@@ -58,13 +58,15 @@ using ClusterShape = Shape<_1, _1, _1>;
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
+// NOTE: ScheduleAuto does NOT pick the ptr-array mainloop for GroupProblemShape — the
+// grouped (array-of-pointers) kernels must be requested explicitly via the PtrArray tags.
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OpClass, TileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAcc, ElementAcc,
     void, LayoutD*, AlignD,           // no C source (beta = 0)
     ElementD, LayoutD*, AlignD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+    cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OpClass,
@@ -74,7 +76,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100>::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
