@@ -80,6 +80,15 @@ class _LoraEnvs:
     SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE = _GatedBool(
         "SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE", True
     )
+    # opt6 (bf16-only): skip the activation kernel's redundant activation_lora_input
+    # side-capture at prefill — for bf16 it holds the SAME values as the permuted
+    # activated buffer (no output scale, unlike fp8/fp4), so the down-LoRA shrink
+    # reads activated_out via the expanded->permuted row map instead. Saves the
+    # [num_tokens*top_k, inter] bf16 HBM write (~50 MB/layer at 4096-tok chunks).
+    # Default True: only the bf16 LoRA dispatch consults it; fp8/nvfp4 are untouched.
+    SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE = _GatedBool(
+        "SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE", True
+    )
     # opt3: cache the layer-static fields of LoRAInfo so _get_lora_info rebuilds only the
     # per-batch fields each forward — cuts the per-layer Python cost paid on the eager
     # prefill path (decode runs under cuda-graph, so it sees this only at capture).

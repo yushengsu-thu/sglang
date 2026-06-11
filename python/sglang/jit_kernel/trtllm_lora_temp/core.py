@@ -315,7 +315,7 @@ def trtllm_bf16_routed_moe_lora(
     gemm1_weights: torch.Tensor,
     gemm2_weights: torch.Tensor,
     gate_up_lora_delta: torch.Tensor,
-    activation_lora_input: torch.Tensor,
+    activation_lora_input: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     intermediate_size: int,
@@ -329,6 +329,8 @@ def trtllm_bf16_routed_moe_lora(
     activation_type: Optional[int] = None,
     lora_ready_event: int = 0,
     gemm2_done_event: int = 0,
+    activated_out: Optional[torch.Tensor] = None,
+    expanded_to_permuted_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE-LoRA: decomposed trtllm pipeline (permute -> raw gate_up GEMM ->
     LoRA-aware activation -> down GEMM), bf16 end-to-end (no quantization).
@@ -336,7 +338,13 @@ def trtllm_bf16_routed_moe_lora(
     (shuffled + BlockMajorK). With do_finalize=False returns
     (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) for the
     python-side down-LoRA delta + trtllm_fp8_block_scale_moe_lora_finalize
-    (which is pure bf16 and shared across fp8/fp4/bf16)."""
+    (which is pure bf16 and shared across fp8/fp4/bf16).
+
+    opt6: pass ``activation_lora_input=None`` with ``activated_out`` (contiguous
+    [>=max_padded, inter] bf16) + ``expanded_to_permuted_out`` (int32
+    [num_tokens*top_k]) to skip the redundant expanded-layout side-capture; the
+    down-LoRA shrink then reads ``activated_out`` via the row map (bf16-only —
+    fp8/fp4 *need* the capture because their activated output is quantized)."""
     from flashinfer.fused_moe.core import ActivationType
     from flashinfer.utils import device_support_pdl
 
@@ -350,7 +358,10 @@ def trtllm_bf16_routed_moe_lora(
         )
 
     assert gate_up_lora_delta.is_contiguous()
-    assert activation_lora_input.is_contiguous()
+    if activation_lora_input is not None:
+        assert activation_lora_input.is_contiguous()
+    else:
+        assert activated_out is not None and expanded_to_permuted_out is not None
 
     result = get_sgl_trtllm_moe_sm100_raw_module().sgl_trtllm_bf16_routed_moe_lora(
         topk_ids,
@@ -374,6 +385,8 @@ def trtllm_bf16_routed_moe_lora(
         activation_lora_input,
         lora_ready_event,
         gemm2_done_event,
+        activated_out,
+        expanded_to_permuted_out,
     )
 
     return output if do_finalize else result

@@ -3440,10 +3440,12 @@ class Bf16LoraLauncher {
       TensorView const& gemm1_weights,
       TensorView const& gemm2_weights,
       TensorView const& gate_up_lora_delta,
-      TensorView const& activation_lora_input,
+      Optional<TensorView> const& activation_lora_input,
       TensorView const& output,
       int64_t lora_ready_event,
-      int64_t gemm2_done_event)
+      int64_t gemm2_done_event,
+      Optional<TensorView> const& activated_out,
+      Optional<TensorView> const& expanded_to_permuted_out)
       : expert_indices_(expert_indices),
         routing_bias_(routing_bias),
         hidden_states_(hidden_states),
@@ -3453,7 +3455,9 @@ class Bf16LoraLauncher {
         activation_lora_input_(activation_lora_input),
         output_(output),
         lora_ready_event_(lora_ready_event),
-        gemm2_done_event_(gemm2_done_event) {}
+        gemm2_done_event_(gemm2_done_event),
+        activated_out_(activated_out),
+        expanded_to_permuted_out_(expanded_to_permuted_out) {}
 
   // Returns {output} when do_finalize, else {gemm2_output, expert_weights,
   // expanded_idx_to_permuted_idx} for a downstream finalize kernel.
@@ -3532,6 +3536,17 @@ class Bf16LoraLauncher {
         btg::Dtype::Bfloat16,
         norm_topk_prob,
         /*routing_replay_out=*/nullptr);
+
+    // opt6: export the expanded->permuted row map so the python-side down-LoRA
+    // shrink can read the permuted activated buffer directly (D2D, 4B/expanded-row).
+    if (expanded_to_permuted_out_.has_value()) {
+      cudaMemcpyAsync(
+          expanded_to_permuted_out_.value().data_ptr(),
+          expanded_idx_to_permuted_idx.data_ptr(),
+          sizeof(int32_t) * num_tokens * top_k,
+          cudaMemcpyDeviceToDevice,
+          stream);
+    }
 
     int64_t const tile = tile_tokens_dim;
 
@@ -3626,7 +3641,19 @@ class Bf16LoraLauncher {
     };
     static int const actOptMode = envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC") ? 1 : 0;
 
-    Tensor activated_bf16 = alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
+    // opt6: when the caller provides a (permuted-layout) activated buffer, write the
+    // activation output there and skip the redundant expanded-layout side-capture —
+    // for bf16 both hold the same values (no output scale, unlike fp8/fp4).
+    Tensor activated_bf16;
+    void* activated_ptr = nullptr;
+    if (activated_out_.has_value()) {
+      TVM_FFI_ICHECK(activated_out_.value().size(0) >= max_num_padded_tokens)
+          << "activated_out rows < max_num_padded_tokens (" << max_num_padded_tokens << ")";
+      activated_ptr = activated_out_.value().data_ptr();
+    } else {
+      activated_bf16 = alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
+      activated_ptr = activated_bf16.data_ptr();
+    }
     {
       moe::dev::activation::Data actData;
       actData.mDtypeElt = btg::Dtype::Bfloat16;
@@ -3634,11 +3661,14 @@ class Bf16LoraLauncher {
       actData.mUseDeepSeekFp8 = false;
       actData.inPtr = gate_up_bf16.data_ptr();
       actData.interleavedGateUpInput = true;
-      actData.outPtr = activated_bf16.data_ptr();
+      actData.outPtr = activated_ptr;
       actData.inDqSfsPtr = nullptr;
       actData.outDqSfsPtr = nullptr;
       actData.gateUpLoraDeltaPtr = static_cast<cutlass::bfloat16_t const*>(gate_up_lora_delta_.data_ptr());
-      actData.activationLoraInputOutPtr = static_cast<cutlass::bfloat16_t*>(activation_lora_input_.data_ptr());
+      actData.activationLoraInputOutPtr =
+          activation_lora_input_.has_value()
+              ? static_cast<cutlass::bfloat16_t*>(activation_lora_input_.value().data_ptr())
+              : nullptr;
       actData.innerDim = gate_up_n;
       actData.numTokens = num_tokens;
       actData.topK = top_k;
@@ -3665,7 +3695,7 @@ class Bf16LoraLauncher {
       size_t ws = gemm_down.getWorkspaceSizeInBytes(top_k, hidden_size, inter, local_num_experts, num_tokens, cfg);
       Tensor gemm_ws = alloc_tensor({(int64_t)ws}, dl_int8, device);
       gemm_down.run(
-          activated_bf16.data_ptr(),
+          activated_ptr,
           /*hiddenStateScale=*/nullptr,
           gemm2_weights_.data_ptr(),
           /*weightScale=*/nullptr,
@@ -3733,8 +3763,10 @@ class Bf16LoraLauncher {
   TensorView gemm1_weights_;
   TensorView gemm2_weights_;
   TensorView gate_up_lora_delta_;
-  TensorView activation_lora_input_;
+  Optional<TensorView> activation_lora_input_;
   TensorView output_;
+  Optional<TensorView> activated_out_;
+  Optional<TensorView> expanded_to_permuted_out_;
   int64_t lora_ready_event_ = 0;
   int64_t gemm2_done_event_ = 0;
 };
@@ -3758,9 +3790,11 @@ Array<Tensor> sgl_trtllm_bf16_routed_moe_lora(
     TensorView output,
     bool norm_topk_prob,
     TensorView gate_up_lora_delta,
-    TensorView activation_lora_input,
+    Optional<TensorView> activation_lora_input,
     int64_t lora_ready_event,
-    int64_t gemm2_done_event) {
+    int64_t gemm2_done_event,
+    Optional<TensorView> activated_out,
+    Optional<TensorView> expanded_to_permuted_out) {
   auto activation_type = validateAndCastActivationType(act_type);
   TVM_FFI_ICHECK(isGatedActivation(activation_type))
       << "sgl_trtllm_bf16_routed_moe_lora currently supports gated (SwiGLU) activation only.";
@@ -3778,12 +3812,38 @@ Array<Tensor> sgl_trtllm_bf16_routed_moe_lora(
   TVM_FFI_ICHECK_EQ(gate_up_lora_delta.ndim(), 3)
       << "gate_up_lora_delta must be [num_tokens, top_k, 2*intermediate_size].";
   TVM_FFI_ICHECK_EQ(gate_up_lora_delta.size(2), 2 * intermediate_size);
-  TVM_FFI_ICHECK_EQ(activation_lora_input.dtype(), dl_bfloat16) << "activation_lora_input must be bf16.";
-  TVM_FFI_ICHECK_EQ(activation_lora_input.ndim(), 3)
-      << "activation_lora_input must be [num_tokens, top_k, intermediate_size].";
-  TVM_FFI_ICHECK_EQ(activation_lora_input.size(2), intermediate_size);
-  TVM_FFI_ICHECK(gate_up_lora_delta.IsContiguous() && activation_lora_input.IsContiguous())
-      << "lora bridge buffers must be contiguous.";
+  TVM_FFI_ICHECK(gate_up_lora_delta.IsContiguous()) << "gate_up_lora_delta must be contiguous.";
+  // opt6 (SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE): the activation kernel's
+  // activation_lora_input side-capture holds the SAME values as the permuted activated
+  // buffer (bf16 has no output scale, unlike fp8/fp4). When the caller provides
+  // activated_out + expanded_to_permuted_out instead, the capture write is skipped and
+  // the python-side down-LoRA shrink reads activated_out via the permuted-row map.
+  if (activation_lora_input.has_value()) {
+    TVM_FFI_ICHECK_EQ(activation_lora_input.value().dtype(), dl_bfloat16)
+        << "activation_lora_input must be bf16.";
+    TVM_FFI_ICHECK_EQ(activation_lora_input.value().ndim(), 3)
+        << "activation_lora_input must be [num_tokens, top_k, intermediate_size].";
+    TVM_FFI_ICHECK_EQ(activation_lora_input.value().size(2), intermediate_size);
+    TVM_FFI_ICHECK(activation_lora_input.value().IsContiguous())
+        << "activation_lora_input must be contiguous.";
+  } else {
+    TVM_FFI_ICHECK(activated_out.has_value() && expanded_to_permuted_out.has_value())
+        << "bf16 LoRA: without activation_lora_input, activated_out + "
+           "expanded_to_permuted_out are required for the down-LoRA shrink.";
+  }
+  if (activated_out.has_value()) {
+    TVM_FFI_ICHECK_EQ(activated_out.value().dtype(), dl_bfloat16) << "activated_out must be bf16.";
+    TVM_FFI_ICHECK(activated_out.value().ndim() == 2 &&
+                   activated_out.value().size(1) == intermediate_size &&
+                   activated_out.value().IsContiguous())
+        << "activated_out must be a contiguous [>=max_padded, intermediate_size] bf16 tensor.";
+    TVM_FFI_ICHECK(expanded_to_permuted_out.has_value())
+        << "activated_out requires expanded_to_permuted_out.";
+    TVM_FFI_ICHECK(expanded_to_permuted_out.value().dtype() == dl_int32 &&
+                   expanded_to_permuted_out.value().numel() == hidden_states.size(0) * top_k &&
+                   expanded_to_permuted_out.value().IsContiguous())
+        << "expanded_to_permuted_out must be contiguous int32 [num_tokens*top_k].";
+  }
 
   int64_t const num_tokens = hidden_states.size(0);
   int64_t const tile_tokens_dim =
@@ -3799,7 +3859,9 @@ Array<Tensor> sgl_trtllm_bf16_routed_moe_lora(
       activation_lora_input,
       output,
       lora_ready_event,
-      gemm2_done_event);
+      gemm2_done_event,
+      activated_out,
+      expanded_to_permuted_out);
   return launcher.run(
       num_experts,
       top_k,
