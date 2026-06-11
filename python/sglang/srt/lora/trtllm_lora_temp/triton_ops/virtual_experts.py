@@ -205,12 +205,13 @@ def fused_sanitize_expert_ids(
 @triton.jit
 def _moe_lora_shrink_splitk_kernel(
     # Pointers
-    a_ptr,  # type: ignore  # [num_tokens, K]
+    a_ptr,  # type: ignore  # [num_tokens, K]  (or [max_padded, K] permuted when HAS_A_ROW_MAP)
     b_ptr,  # type: ignore  # [num_virtual_experts, N, K]
     c_ptr,  # type: ignore  # [num_tokens * top_k, N]  (pre-zeroed when SPLIT_K > 1)
     sorted_token_ids_ptr,  # type: ignore
     expert_ids_ptr,  # type: ignore
     num_tokens_post_padded_ptr,  # type: ignore
+    a_row_map_ptr,  # type: ignore  # opt6: expanded idx -> permuted row in a (or None)
     # Dimensions
     N,  # type: ignore
     K,  # type: ignore
@@ -231,8 +232,15 @@ def _moe_lora_shrink_splitk_kernel(
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
     ENABLE_PDL: tl.constexpr = False,
+    HAS_A_ROW_MAP: tl.constexpr = False,
 ):
-    """Split-K grouped GEMM for the LoRA A (shrink) stage with few virtual experts."""
+    """Split-K grouped GEMM for the LoRA A (shrink) stage with few virtual experts.
+
+    HAS_A_ROW_MAP (opt6): a_ptr is the base path's PERMUTED activated buffer; each
+    expanded token id is translated to its permuted row via a_row_map_ptr. Invalid
+    entries (-1, e.g. non-owned EP slots) contribute zeros — matching the old path,
+    where their activation_lora_input rows were zero-filled by the activation kernel.
+    Output (c) indexing is unchanged (expanded order)."""
     pid = tl.program_id(0)
     pid_sk = pid % SPLIT_K
     pid_mn = pid // SPLIT_K
@@ -270,9 +278,17 @@ def _moe_lora_shrink_splitk_kernel(
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
-    a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    if HAS_A_ROW_MAP:
+        a_rows = tl.load(
+            a_row_map_ptr + offs_token, mask=token_mask, other=-1
+        ).to(tl.int64)
+        a_row_valid = token_mask & (a_rows >= 0)
+        a_rows = tl.where(a_row_valid, a_rows, 0)
+    else:
+        a_rows = offs_token // top_k
+        a_row_valid = token_mask
+
+    a_ptrs = a_ptr + (a_rows[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = (
         b_ptr
         + off_expert * stride_be
@@ -287,7 +303,7 @@ def _moe_lora_shrink_splitk_kernel(
         k_mask = offs_k[:, None] < k_remaining
         a = tl.load(
             a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+            mask=a_row_valid[:, None] & (offs_k[None, :] < k_remaining),
             other=0.0,
         )
         b = tl.load(b_ptrs, mask=k_mask, other=0.0)
@@ -321,6 +337,7 @@ def _invoke_moe_lora_shrink_splitk(
     num_tokens_post_padded: torch.Tensor,
     top_k: int,
     config: dict[str, Any],
+    a_row_map: "torch.Tensor | None" = None,
 ) -> None:
     """Launch split-K shrink kernel for LoRA A with few virtual experts."""
     N = weight.shape[1]
@@ -350,6 +367,7 @@ def _invoke_moe_lora_shrink_splitk(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        a_row_map,
         N,
         K,
         topk_ids.numel(),
@@ -367,6 +385,7 @@ def _invoke_moe_lora_shrink_splitk(
         GROUP_SIZE_M=GROUP_SIZE_M,
         SPLIT_K=SPLIT_K,
         ENABLE_PDL=enable_pdl,
+        HAS_A_ROW_MAP=a_row_map is not None,
         num_warps=config.get("num_warps", 4),
         num_stages=config.get("num_stages", 4),
         **pdl_kwargs,
@@ -642,6 +661,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     stage: str = "all",
     intermediate_buffer: torch.Tensor | None = None,
     expand_wait_event: "torch.cuda.Event | None" = None,
+    a_row_map: "torch.Tensor | None" = None,
 ) -> "torch.Tensor | None":
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -956,6 +976,7 @@ def _merged_experts_fused_moe_lora_add_impl(
             num_tokens_post_padded,
             input_top_k,
             a_stage_config,
+            a_row_map=a_row_map,
         )
 
         if stage == "shrink":
@@ -1099,6 +1120,7 @@ def merged_experts_fused_moe_lora_add(
     stage: str = "all",
     intermediate_buffer: torch.Tensor | None = None,
     expand_wait_event: "torch.cuda.Event | None" = None,
+    a_row_map: "torch.Tensor | None" = None,
 ) -> "torch.Tensor | None":
     """Public API: wraps the registered op with routing_cache support."""
     return _merged_experts_fused_moe_lora_add_impl(
@@ -1121,4 +1143,5 @@ def merged_experts_fused_moe_lora_add(
         stage=stage,
         intermediate_buffer=intermediate_buffer,
         expand_wait_event=expand_wait_event,
+        a_row_map=a_row_map,
     )
