@@ -392,6 +392,35 @@ def trtllm_bf16_routed_moe_lora(
     return output if do_finalize else result
 
 
+def bf16_fold_probe() -> list:
+    """opt7: returns [CUTLASS_MAJOR, CUTLASS_MINOR, 1] — proves the CUTLASS include path
+    is wired into this JIT module (prerequisite for the P1 grouped GEMM)."""
+    return list(get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_fold_probe())
+
+
+def bf16_moe_gemm1_fold_ref(
+    hidden: torch.Tensor,                    # [num_tokens, K] bf16
+    w_fold: torch.Tensor,                    # [E, 2I, K] bf16 (interleaved g/u columns)
+    gate_up_lora_delta: Optional[torch.Tensor],  # [num_expanded, 2I] bf16 or None
+    permuted_row_to_token: torch.Tensor,     # [R] int32
+    permuted_row_to_expanded: torch.Tensor,  # [R] int32
+    permuted_row_to_expert: torch.Tensor,    # [R] int32 (-1 = padding)
+    activated_out: torch.Tensor,             # [R, I] bf16 (output)
+) -> torch.Tensor:
+    """opt7 P0: naive reference fold kernel (gather + interleaved gate/up GEMM +
+    half-contiguous LoRA delta + SwiGLU). Correctness baseline only — never serving."""
+    get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_moe_gemm1_fold_ref(
+        hidden,
+        w_fold,
+        gate_up_lora_delta,
+        permuted_row_to_token,
+        permuted_row_to_expanded,
+        permuted_row_to_expert,
+        activated_out,
+    )
+    return activated_out
+
+
 def trtllm_fp4_block_scale_routed_moe_lora(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
