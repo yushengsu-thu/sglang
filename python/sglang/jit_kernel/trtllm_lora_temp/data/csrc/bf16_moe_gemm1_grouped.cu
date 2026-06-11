@@ -49,7 +49,7 @@ using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutD = cutlass::layout::RowMajor;
 constexpr int AlignA = 8, AlignB = 8, AlignD = 8;
 
-using ArchTag = cutlass::arch::Sm100;
+using ArchTag = cutlass::arch::Sm103;  // GB300 builds sm_103a only; Sm100-tagged kernels are arch-guarded out -> launch fails (run: Error Internal)
 using OpClass = cutlass::arch::OpClassTensorOp;
 using TileShape = Shape<_128, _128, _64>;      // first cut; tuned later against the parity gate
 using ClusterShape = Shape<_1, _1, _1>;
