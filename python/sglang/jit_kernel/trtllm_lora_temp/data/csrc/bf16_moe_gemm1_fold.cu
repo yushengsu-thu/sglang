@@ -31,6 +31,9 @@
 
 #include <cutlass/version.h>  // CUTLASS include path probe (flashinfer/data/cutlass/include)
 
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+
 namespace sgl_bf16_fold {
 
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
