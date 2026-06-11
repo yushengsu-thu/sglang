@@ -65,7 +65,7 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     ElementAcc, ElementAcc,
     void, LayoutD*, AlignD,           // no C source (beta = 0)
     ElementD, LayoutD*, AlignD,
-    cutlass::epilogue::PtrArrayNoSmemWarpSpecialized2Sm>::CollectiveOp;  // P2 base: simple TMEM->reg->gmem epilogue (the one we fork for the fold)
+    cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;  // P1 parity config (65.6us). P2 NOTE: NoSmem epilogue measured 84.4us at the same shapes (+19us) — the fold fork (half-width store) starts from sm100_epilogue_array_nosmem.hpp and must win back most of that; net fold value stays positive (act 33us + round-trip ~6us).
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OpClass,
