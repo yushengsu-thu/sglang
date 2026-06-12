@@ -436,6 +436,16 @@ def bf16_moe_gemm1_grouped(
     return gate_up_out
 
 
+def bf16_gather_rows(
+    hidden: torch.Tensor,     # [num_tokens, K] bf16
+    row2token: torch.Tensor,  # [R] int32 (-1 = padding, skipped)
+    out: torch.Tensor,        # [R, K] bf16
+) -> torch.Tensor:
+    """opt7 P3: bandwidth-bound row gather (replaces moe::dev::permute on the fold path)."""
+    get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_gather_rows(hidden, row2token, out)
+    return out
+
+
 def bf16_moe_gemm1_fold_gemm(
     permuted_hidden: torch.Tensor,        # [R_padded, K] bf16
     w_fold: torch.Tensor,                 # [E, 2I, K] bf16
