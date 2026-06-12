@@ -131,19 +131,22 @@ using FoldEpilogue =
 using GemmKernelFold = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, FoldEpilogue>;
 using GemmFold = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelFold>;
 
-// Extended group-arg builder: also fills the HALF-width D pointers/strides and the
-// per-group perm2exp segment pointers for the fold epilogue.
+// Extended group-arg builder for the fold: derives per-LOCAL-expert segments from the
+// routing's AUTHORITATIVE cta map (cta_idx_xy_to_batch_idx: contiguous CTA ranges per
+// expert, in expert order; segment offset = firstCta * tile, rows = numCtas * tile).
+// This avoids any assumption about num_tokens_per_expert semantics (global vs
+// local-zeroed) — the layout is reconstructed from the same data the GEMM2 runner uses.
 __global__ void buildGroupArgsFoldKernel(
-    int const* __restrict__ num_tokens_per_expert,
-    int E,                // GLOBAL expert count (groups; non-local counts are 0 => empty groups)
-    int local_expert_offset,
+    int const* __restrict__ cta_to_local_expert,  // [maxCtas]
+    int const* __restrict__ num_non_exiting_ctas, // [1]
+    int E_local,
     int tile,
     int N,            // full interleaved width (2I)
     int K,
     ElementA const* A_base,
     ElementB const* B_base,
     ElementD* Dh_base,                    // [R_padded, I] half-width activated out
-    int const* perm2exp_base,             // [R_padded] global permuted row -> expanded idx
+    int const* perm2exp_base,             // [R_padded] permuted row -> expanded idx
     UnderlyingShape* shapes,
     ElementA const** ptrA,
     ElementB const** ptrB,
@@ -154,20 +157,34 @@ __global__ void buildGroupArgsFoldKernel(
     StrideD* sDh) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
   int const I = N / 2;
-  int64_t off = 0;
-  for (int e = 0; e < E; ++e) {
-    int const cnt = num_tokens_per_expert[e];
-    int const m = ((cnt + tile - 1) / tile) * tile;   // matches routing: tile-aligned cumsum over GLOBAL experts (non-local counts are zeroed by routing)
-    int const le = e - local_expert_offset;           // weight index; only valid when cnt>0
-    shapes[e] = UnderlyingShape{m, N, K};
-    ptrA[e] = A_base + off * K;
-    ptrB[e] = B_base + (int64_t)((le >= 0) ? le : 0) * N * K;
-    ptrDh[e] = Dh_base + off * I;
-    ptrP2E[e] = perm2exp_base + off;
-    sA[e] = cutlass::make_cute_packed_stride(StrideA{}, {m, K, 1});
-    sB[e] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-    sDh[e] = cutlass::make_cute_packed_stride(StrideD{}, {m, I, 1});
-    off += m;
+  // init all local-expert groups empty
+  for (int g = 0; g < E_local; ++g) {
+    shapes[g] = UnderlyingShape{0, N, K};
+    ptrA[g] = A_base;
+    ptrB[g] = B_base + (int64_t)g * N * K;
+    ptrDh[g] = Dh_base;
+    ptrP2E[g] = perm2exp_base;
+    sA[g] = cutlass::make_cute_packed_stride(StrideA{}, {tile, K, 1});
+    sB[g] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    sDh[g] = cutlass::make_cute_packed_stride(StrideD{}, {tile, I, 1});
+  }
+  int const n = *num_non_exiting_ctas;
+  int c = 0;
+  while (c < n) {
+    int const g = cta_to_local_expert[c];
+    int cnt = 0;
+    while (c + cnt < n && cta_to_local_expert[c + cnt] == g) ++cnt;
+    if (g >= 0 && g < E_local) {
+      int64_t const off = (int64_t)c * tile;
+      int const m = cnt * tile;
+      shapes[g] = UnderlyingShape{m, N, K};
+      ptrA[g] = A_base + off * K;
+      ptrDh[g] = Dh_base + off * I;
+      ptrP2E[g] = perm2exp_base + off;
+      sA[g] = cutlass::make_cute_packed_stride(StrideA{}, {m, K, 1});
+      sDh[g] = cutlass::make_cute_packed_stride(StrideD{}, {m, I, 1});
+    }
+    c += cnt;
   }
 }
 
@@ -175,11 +192,11 @@ __global__ void buildGroupArgsFoldKernel(
 char const* run_grouped_fold(
     void const* permuted_hidden,
     void const* w_fold,
-    int const* num_tokens_per_expert,
+    int const* cta_to_local_expert,   // routing cta_idx_xy_to_batch_idx
+    int const* num_non_exiting_ctas,  // routing scalar
     int const* perm2exp,        // [R_padded] permuted row -> expanded idx (-1 pad)
     void const* delta,          // [num_expanded, 2I] half-contiguous, or nullptr
-    int E,                      // GLOBAL expert count (group count)
-    int local_expert_offset,    // weight index base (w_fold holds LOCAL experts only)
+    int E,                      // LOCAL expert count (= group count = w_fold size 0)
     int N,                      // full width 2I
     int K,
     int tile,
@@ -207,7 +224,7 @@ char const* run_grouped_fold(
   auto* sDh = reinterpret_cast<StrideD*>(base + o_sd);
 
   buildGroupArgsFoldKernel<<<1, 32, 0, stream>>>(
-      num_tokens_per_expert, E, local_expert_offset, tile, N, K,
+      cta_to_local_expert, num_non_exiting_ctas, E, tile, N, K,
       static_cast<ElementA const*>(permuted_hidden),
       static_cast<ElementB const*>(w_fold),
       static_cast<ElementD*>(activated_out),

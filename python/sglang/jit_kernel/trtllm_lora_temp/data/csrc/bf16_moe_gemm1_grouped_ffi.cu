@@ -5,6 +5,7 @@
 #include "tvm_ffi_utils.h"
 
 #include <cuda_runtime.h>
+#include <vector>
 
 using tvm::ffi::Optional;
 
@@ -22,11 +23,11 @@ char const* run_grouped(
 char const* run_grouped_fold(
     void const* permuted_hidden,
     void const* w_fold,
-    int const* num_tokens_per_expert,
+    int const* cta_to_local_expert,
+    int const* num_non_exiting_ctas,
     int const* perm2exp,
     void const* delta,
     int E,
-    int local_expert_offset,
     int N,
     int K,
     int tile,
@@ -106,13 +107,31 @@ void sgl_bf16_moe_gemm1_fold_gemm(
   }
   auto device = permuted_hidden.device();
   cudaStream_t stream = get_stream(device);
+  // Test-only shim: synthesize the routing cta map from per-expert counts on the host.
+  int64_t const R = permuted_hidden.size(0);
+  std::vector<int> h_counts(E);
+  cudaMemcpyAsync(h_counts.data(), num_tokens_per_expert.data_ptr(), sizeof(int) * E,
+                  cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+  std::vector<int> h_map;
+  h_map.reserve(R / tile + 1);
+  for (int e = 0; e < E; ++e) {
+    int const ctas = (h_counts[e] + static_cast<int>(tile) - 1) / static_cast<int>(tile);
+    for (int c = 0; c < ctas; ++c) h_map.push_back(e);
+  }
+  int h_n = static_cast<int>(h_map.size());
+  Tensor d_map = alloc_tensor({(int64_t)std::max(h_n, 1)}, dl_int32, device);
+  Tensor d_n = alloc_tensor({1}, dl_int32, device);
+  cudaMemcpyAsync(d_map.data_ptr(), h_map.data(), sizeof(int) * h_n, cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_n.data_ptr(), &h_n, sizeof(int), cudaMemcpyHostToDevice, stream);
   char const* err = sgl_bf16_fold_p1::run_grouped_fold(
       permuted_hidden.data_ptr(),
       w_fold.data_ptr(),
-      static_cast<int const*>(num_tokens_per_expert.data_ptr()),
+      static_cast<int const*>(d_map.data_ptr()),
+      static_cast<int const*>(d_n.data_ptr()),
       static_cast<int const*>(perm2exp.data_ptr()),
       delta_ptr,
-      E, /*local_expert_offset=*/0, N, K, static_cast<int>(tile),
+      E, N, K, static_cast<int>(tile),
       activated_out.data_ptr(),
       stream);
   TVM_FFI_ICHECK(err == nullptr) << "bf16 fold GEMM failed: " << err;

@@ -31,8 +31,8 @@ void launch_gather_rows(void const* hidden, int const* row2token, void* out,
 }
 namespace sgl_bf16_fold_p1 {
 char const* run_grouped_fold(void const* permuted_hidden, void const* w_fold,
-                             int const* num_tokens_per_expert, int const* perm2exp,
-                             void const* delta, int E, int local_expert_offset, int N,
+                             int const* cta_to_local_expert, int const* num_non_exiting_ctas,
+                             int const* perm2exp, void const* delta, int E, int N,
                              int K, int tile, void* activated_out, cudaStream_t stream);
 }
 #include <algorithm>
@@ -3608,11 +3608,11 @@ class Bf16LoraLauncher {
       char const* fold_err = sgl_bf16_fold_p1::run_grouped_fold(
           permuted_hidden_bf16.data_ptr(),
           gemm1_weights_fold_.value().data_ptr(),
-          static_cast<int*>(num_tokens_per_expert.data_ptr()),
+          static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+          static_cast<int*>(num_non_exiting_ctas.data_ptr()),
           permuted_idx_to_expanded_ptr,
           gate_up_lora_delta_.data_ptr(),
-          static_cast<int>(num_experts),
-          static_cast<int>(local_expert_offset),
+          static_cast<int>(local_num_experts),
           static_cast<int>(gate_up_n),
           static_cast<int>(hidden_size),
           static_cast<int>(tile),
