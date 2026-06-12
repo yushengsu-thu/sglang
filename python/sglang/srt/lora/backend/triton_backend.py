@@ -226,6 +226,40 @@ class TritonLoRABackend(BaseLoRABackend):
 
         self.sgemm_batch_info = sgemm
 
+    # opt8: persistent extend-batch buffers for the piecewise CUDA graph path
+    # (see the elif branch in prepare_lora_batch). bs capacity 256 covers any
+    # realistic extend request count per chunk.
+    _PIECEWISE_MAX_BS = 256
+
+    def _use_piecewise_persistent(self, forward_batch: ForwardBatch) -> bool:
+        from sglang.srt.server_args import get_global_server_args
+
+        return (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.batch_size <= self._PIECEWISE_MAX_BS
+            and not get_global_server_args().disable_piecewise_cuda_graph
+        )
+
+    def _get_piecewise_batch_info(self) -> LoRABatchInfo:
+        if getattr(self, "_piecewise_batch_info", None) is None:
+            mb = self._PIECEWISE_MAX_BS
+            with torch.device(self.device):
+                self._piecewise_batch_info = LoRABatchInfo(
+                    bs=mb,
+                    use_cuda_graph=True,
+                    num_segments=mb,
+                    seg_lens=torch.zeros(mb, dtype=torch.int32),
+                    seg_indptr=torch.zeros(mb + 1, dtype=torch.int32),
+                    max_len=1,
+                    weight_indices=torch.zeros(mb, dtype=torch.int32),
+                    lora_ranks=torch.zeros(
+                        self.max_loras_per_batch, dtype=torch.int64
+                    ),
+                    scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                    permutation=None,
+                )
+        return self._piecewise_batch_info
+
     def prepare_lora_batch(
         self,
         forward_batch: ForwardBatch,
@@ -254,6 +288,21 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size
+        elif self._use_piecewise_persistent(forward_batch):
+            # opt8: under the piecewise CUDA graph, the dense/embedding LoRA layers
+            # consume these tensors INSIDE captured graph pieces — fresh allocations
+            # per batch change tensor identity (dynamo guard miss -> runtime
+            # recompilation -> "PCG capture stream is not set" assert) and would bind
+            # stale storages into the replayed graphs. Mirror the decode
+            # cuda_graph_batch_info: one persistent buffer set, updated in place.
+            batch_info = self._get_piecewise_batch_info()
+            batch_info.bs = bs
+            batch_info.num_segments = bs
+            batch_info.seg_lens[:bs].copy_(forward_batch.extend_seq_lens)
+            torch.cumsum(
+                batch_info.seg_lens[:bs], dim=0, out=batch_info.seg_indptr[1 : bs + 1]
+            )
+            batch_info.max_len = int(max(forward_batch.extend_seq_lens_cpu))
         else:
             max_len = (
                 # Calculate max_len from the CPU copy to avoid D2H transfer.
