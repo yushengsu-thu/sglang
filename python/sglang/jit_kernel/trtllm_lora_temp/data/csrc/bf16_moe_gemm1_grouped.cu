@@ -29,6 +29,8 @@
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/util/packed_stride.hpp>
 
+#include "sgl_bf16_fold_epilogue.hpp"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -65,7 +67,7 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     ElementAcc, ElementAcc,
     void, LayoutD*, AlignD,           // no C source (beta = 0)
     ElementD, LayoutD*, AlignD,
-    cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;
+    cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;  // P1 parity config (65.6us). P2 NOTE: NoSmem epilogue measured 84.4us at the same shapes (+19us) — the fold fork (half-width store) starts from sm100_epilogue_array_nosmem.hpp and must win back most of that; net fold value stays positive (act 33us + round-trip ~6us).
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OpClass,
@@ -117,6 +119,142 @@ __global__ void buildGroupArgsKernel(
     sD[e] = cutlass::make_cute_packed_stride(StrideD{}, {m, N, 1});
     off += m;
   }
+}
+
+// ---- P2: fold-epilogue GEMM (same mainloop, half-width D + SwiGLU/LoRA fold) ----
+// Wrap in the same adapter the stock builder applies for the WarpSpecialized NoSmem path:
+// it supplies the Load/Store pipeline interface the sm100 array kernel requires.
+using FoldEpilogueCore = sgl_bf16_fold::Sm100BF16FoldArrayEpilogue<
+    TileShape, ElementAcc, ElementD, StrideD*, typename CollectiveEpilogue::CopyOpT2R>;
+using FoldEpilogue =
+    cutlass::epilogue::collective::detail::Sm100TmaWarpSpecializedAdapter<FoldEpilogueCore>;
+using GemmKernelFold = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, FoldEpilogue>;
+using GemmFold = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelFold>;
+
+// Extended group-arg builder: also fills the HALF-width D pointers/strides and the
+// per-group perm2exp segment pointers for the fold epilogue.
+__global__ void buildGroupArgsFoldKernel(
+    int const* __restrict__ num_tokens_per_expert,
+    int E,
+    int tile,
+    int N,            // full interleaved width (2I)
+    int K,
+    ElementA const* A_base,
+    ElementB const* B_base,
+    ElementD* Dh_base,                    // [R_padded, I] half-width activated out
+    int const* perm2exp_base,             // [R_padded] global permuted row -> expanded idx
+    UnderlyingShape* shapes,
+    ElementA const** ptrA,
+    ElementB const** ptrB,
+    ElementD** ptrDh,
+    int const** ptrP2E,
+    StrideA* sA,
+    StrideB* sB,
+    StrideD* sDh) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  int const I = N / 2;
+  int64_t off = 0;
+  for (int e = 0; e < E; ++e) {
+    int const cnt = num_tokens_per_expert[e];
+    int const m = ((cnt + tile - 1) / tile) * tile;
+    shapes[e] = UnderlyingShape{m, N, K};
+    ptrA[e] = A_base + off * K;
+    ptrB[e] = B_base + (int64_t)e * N * K;
+    ptrDh[e] = Dh_base + off * I;
+    ptrP2E[e] = perm2exp_base + off;
+    sA[e] = cutlass::make_cute_packed_stride(StrideA{}, {m, K, 1});
+    sB[e] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    sDh[e] = cutlass::make_cute_packed_stride(StrideD{}, {m, I, 1});
+    off += m;
+  }
+}
+
+// P2 entry: grouped gate_up GEMM with the fused SwiGLU+LoRA fold epilogue.
+char const* run_grouped_fold(
+    void const* permuted_hidden,
+    void const* w_fold,
+    int const* num_tokens_per_expert,
+    int const* perm2exp,        // [R_padded] permuted row -> expanded idx (-1 pad)
+    void const* delta,          // [num_expanded, 2I] half-contiguous, or nullptr
+    int E,
+    int N,                      // full width 2I
+    int K,
+    int tile,
+    void* activated_out,        // [R_padded, I]
+    cudaStream_t stream) {
+  auto align16 = [](size_t x) { return (x + 15) & ~size_t(15); };
+  size_t off0 = 0;
+  size_t const o_shapes = off0; off0 += align16(sizeof(UnderlyingShape) * E);
+  size_t const o_pa = off0; off0 += align16(sizeof(void*) * E);
+  size_t const o_pb = off0; off0 += align16(sizeof(void*) * E);
+  size_t const o_pd = off0; off0 += align16(sizeof(void*) * E);
+  size_t const o_pp = off0; off0 += align16(sizeof(void*) * E);
+  size_t const o_sa = off0; off0 += align16(sizeof(StrideA) * E);
+  size_t const o_sb = off0; off0 += align16(sizeof(StrideB) * E);
+  size_t const o_sd = off0; off0 += align16(sizeof(StrideD) * E);
+  char* base = nullptr;
+  if (cudaMallocAsync(&base, off0, stream) != cudaSuccess) return "scratch alloc failed";
+  auto* shapes = reinterpret_cast<UnderlyingShape*>(base + o_shapes);
+  auto* ptrA = reinterpret_cast<ElementA const**>(base + o_pa);
+  auto* ptrB = reinterpret_cast<ElementB const**>(base + o_pb);
+  auto* ptrDh = reinterpret_cast<ElementD**>(base + o_pd);
+  auto* ptrP2E = reinterpret_cast<int const**>(base + o_pp);
+  auto* sA = reinterpret_cast<StrideA*>(base + o_sa);
+  auto* sB = reinterpret_cast<StrideB*>(base + o_sb);
+  auto* sDh = reinterpret_cast<StrideD*>(base + o_sd);
+
+  buildGroupArgsFoldKernel<<<1, 32, 0, stream>>>(
+      num_tokens_per_expert, E, tile, N, K,
+      static_cast<ElementA const*>(permuted_hidden),
+      static_cast<ElementB const*>(w_fold),
+      static_cast<ElementD*>(activated_out),
+      perm2exp,
+      shapes, ptrA, ptrB, ptrDh, ptrP2E, sA, sB, sDh);
+
+  cutlass::KernelHardwareInfo hw_info;
+  cudaGetDevice(&hw_info.device_id);
+  hw_info.sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  typename GemmFold::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {E, shapes, /*host_problem_shapes=*/nullptr},
+      {ptrA, sA, ptrB, sB},
+      {ptrDh, sDh, ptrP2E, static_cast<ElementD const*>(delta), N / 2},
+      hw_info,
+  };
+
+  GemmFold gemm;
+  size_t ws_size = GemmFold::get_workspace_size(args);
+  void* ws = nullptr;
+  if (ws_size > 0 && cudaMallocAsync(&ws, ws_size, stream) != cudaSuccess) {
+    cudaFreeAsync(base, stream);
+    return "workspace alloc failed";
+  }
+  static thread_local char errbuf2[256];
+  char const* err = nullptr;
+  auto status = gemm.can_implement(args);
+  if (status != cutlass::Status::kSuccess) {
+    snprintf(errbuf2, sizeof(errbuf2), "fold can_implement: %s", cutlass::cutlassGetStatusString(status));
+    err = errbuf2;
+  } else {
+    status = gemm.initialize(args, ws, stream);
+    if (status != cutlass::Status::kSuccess) {
+      snprintf(errbuf2, sizeof(errbuf2), "fold initialize: %s", cutlass::cutlassGetStatusString(status));
+      err = errbuf2;
+    } else {
+      status = gemm.run(stream);
+      if (status != cutlass::Status::kSuccess) {
+        cudaError_t lc = cudaGetLastError();
+        snprintf(errbuf2, sizeof(errbuf2), "fold run: %s (cuda: %s)",
+                 cutlass::cutlassGetStatusString(status), cudaGetErrorString(lc));
+        err = errbuf2;
+      }
+    }
+  }
+  if (ws != nullptr) cudaFreeAsync(ws, stream);
+  cudaFreeAsync(base, stream);
+  return err;
 }
 
 // Plain C++ entry point (called from bf16_moe_gemm1_grouped_ffi.cu). Returns nullptr on
