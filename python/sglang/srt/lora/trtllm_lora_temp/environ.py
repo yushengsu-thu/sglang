@@ -92,6 +92,15 @@ class _LoraEnvs:
     SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE = _GatedBool(
         "SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE", False
     )
+    # opt7 (bf16-only): the in-MoE fold. DUAL_LAYOUT keeps a plain interleaved [E,2I,K]
+    # copy of gemm1 weights at load (+~9.7GB/rank on this model) so the prefill path can
+    # run the CUTLASS fold GEMM while decode keeps the tuned trtllm cubin. GEMM1_FOLD
+    # switches the prefill (>=512 tokens) Bf16LoraLauncher pipeline to
+    # gather -> fold-GEMM(SwiGLU+LoRA in epilogue) -> down GEMM, replacing
+    # permute + gate_up GEMM + activation (measured 101.5us vs 270us at per-rank shapes).
+    # Default False until e2e-validated (acc + matrix); requires DUAL_LAYOUT.
+    SGLANG_OPT_BF16_MOE_DUAL_LAYOUT = _GatedBool("SGLANG_OPT_BF16_MOE_DUAL_LAYOUT", False)
+    SGLANG_OPT_BF16_MOE_GEMM1_FOLD = _GatedBool("SGLANG_OPT_BF16_MOE_GEMM1_FOLD", False)
     # opt3: cache the layer-static fields of LoRAInfo so _get_lora_info rebuilds only the
     # per-batch fields each forward — cuts the per-layer Python cost paid on the eager
     # prefill path (decode runs under cuda-graph, so it sees this only at capture).
