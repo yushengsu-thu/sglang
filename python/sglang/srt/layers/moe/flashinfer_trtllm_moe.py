@@ -293,3 +293,148 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
         kwargs["activation_type"] = ActivationType(activation_type)
 
     return trtllm_fp8_per_tensor_scale_moe(**kwargs)
+
+
+def _fake_bf16_routed_moe(
+    topk_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: Optional[int] = None,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+@register_custom_op(fake_impl=_fake_bf16_routed_moe)
+def trtllm_bf16_routed_moe_wrapper(
+    topk_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: Optional[int] = None,
+) -> torch.Tensor:
+    # Custom-op wrapper so dynamo treats the flashinfer call as opaque: the raw call
+    # JIT-loads the module and logs inside the traced region, which is a hard
+    # torch._dynamo Unsupported under the piecewise-cuda-graph compile (the fp8
+    # paths already use this wrapper pattern for the same reason).
+    try:
+        from flashinfer.fused_moe import trtllm_bf16_routed_moe
+    except ImportError as e:
+        raise ImportError(
+            "Can't import trtllm_bf16_routed_moe from flashinfer. "
+            "Please check flashinfer version."
+        ) from e
+    kwargs = {
+        "topk_ids": topk_ids,
+        "hidden_states": hidden_states,
+        "gemm1_weights": gemm1_weights,
+        "gemm2_weights": gemm2_weights,
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "n_group": n_group,
+        "topk_group": topk_group,
+        "intermediate_size": intermediate_size,
+        "local_expert_offset": local_expert_offset,
+        "local_num_experts": local_num_experts,
+        "routing_method_type": routing_method_type,
+        "routed_scaling_factor": routed_scaling_factor,
+        "tune_max_num_tokens": tune_max_num_tokens,
+    }
+    if activation_type is not None:
+        from flashinfer.fused_moe.core import ActivationType
+
+        kwargs["activation_type"] = ActivationType(activation_type)
+
+    return trtllm_bf16_routed_moe(**kwargs)
+
+
+def _fake_bf16_moe(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: Optional[int] = None,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+@register_custom_op(fake_impl=_fake_bf16_moe)
+def trtllm_bf16_moe_wrapper(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: Optional[int] = None,
+) -> torch.Tensor:
+    try:
+        from flashinfer.fused_moe import trtllm_bf16_moe
+    except ImportError as e:
+        raise ImportError(
+            "Can't import trtllm_bf16_moe from flashinfer. "
+            "Please check flashinfer version."
+        ) from e
+    kwargs = {
+        "routing_logits": routing_logits,
+        "routing_bias": routing_bias,
+        "hidden_states": hidden_states,
+        "gemm1_weights": gemm1_weights,
+        "gemm2_weights": gemm2_weights,
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "n_group": n_group,
+        "topk_group": topk_group,
+        "intermediate_size": intermediate_size,
+        "local_expert_offset": local_expert_offset,
+        "local_num_experts": local_num_experts,
+        "routing_method_type": routing_method_type,
+        "routed_scaling_factor": routed_scaling_factor,
+        "tune_max_num_tokens": tune_max_num_tokens,
+    }
+    if activation_type is not None:
+        from flashinfer.fused_moe.core import ActivationType
+
+        kwargs["activation_type"] = ActivationType(activation_type)
+
+    return trtllm_bf16_moe(**kwargs)

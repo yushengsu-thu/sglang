@@ -1062,24 +1062,14 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    trtllm_bf16_routed_moe = None
-    trtllm_bf16_moe = None
-    if use_routed_topk:
-        try:
-            from flashinfer.fused_moe import trtllm_bf16_routed_moe
-        except ImportError as e:
-            raise ImportError(
-                "Can't import trtllm_bf16_routed_moe from flashinfer. "
-                "Please check flashinfer version to use bf16 with flashinfer_trtllm_routed backend."
-            ) from e
-    else:
-        try:
-            from flashinfer.fused_moe import trtllm_bf16_moe
-        except ImportError as e:
-            raise ImportError(
-                "Can't import trtllm_bf16_moe from flashinfer. "
-                "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
-            ) from e
+    # Custom-op wrappers (torch.compile/piecewise compatibility — the raw flashinfer
+    # calls JIT-load + log inside the traced region, a hard dynamo Unsupported; same
+    # pattern as the fp8 wrappers). Flashinfer availability is checked inside the
+    # wrappers at first call.
+    from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
+        trtllm_bf16_moe_wrapper,
+        trtllm_bf16_routed_moe_wrapper,
+    )
 
     _SUPPORTED_BF16_ACTIVATIONS = {"silu", "relu2"}
     assert runner_config.activation in _SUPPORTED_BF16_ACTIVATIONS, (
@@ -1116,7 +1106,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 topk_ids=topk_output.topk_ids,
                 topk_weights=topk_output.topk_weights,
             )
-            final_hidden_states = trtllm_bf16_routed_moe(
+            final_hidden_states = trtllm_bf16_routed_moe_wrapper(
                 topk_ids=packed_topk_ids,
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
@@ -1128,21 +1118,21 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 intermediate_size=runner_config.intermediate_size_per_partition,
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=runner_config.num_local_experts,
-                routing_method_type=routing_method_type,
+                routing_method_type=int(routing_method_type),
                 routed_scaling_factor=(
                     runner_config.routed_scaling_factor
                     if runner_config.routed_scaling_factor is not None
                     else 1.0
                 ),
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
-                activation_type=activation_type,
+                activation_type=int(activation_type),
             )
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
             topk_config = topk_output.topk_config
 
             # Call the fused kernel
-            final_hidden_states = trtllm_bf16_moe(
+            final_hidden_states = trtllm_bf16_moe_wrapper(
                 routing_logits=topk_output.router_logits,
                 routing_bias=topk_config.correction_bias,
                 hidden_states=hidden_states,
@@ -1155,10 +1145,14 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 intermediate_size=runner_config.intermediate_size_per_partition,
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=runner_config.num_local_experts,
-                routing_method_type=runner_config.routing_method_type,
+                routing_method_type=(
+                    int(runner_config.routing_method_type)
+                    if runner_config.routing_method_type is not None
+                    else None
+                ),
                 routed_scaling_factor=runner_config.routed_scaling_factor,
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
-                activation_type=activation_type,
+                activation_type=int(activation_type),
             )
 
     return StandardCombineInput(hidden_states=final_hidden_states)
