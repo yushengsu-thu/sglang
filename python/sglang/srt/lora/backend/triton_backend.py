@@ -246,7 +246,13 @@ class TritonLoRABackend(BaseLoRABackend):
             with torch.device(self.device):
                 self._piecewise_batch_info = LoRABatchInfo(
                     bs=mb,
-                    use_cuda_graph=True,
+                    # False: _add_moe_lora_info keys its buffer choice off this flag —
+                    # True selects the decode-sized moe_cg_buffers (token_lora_mapping
+                    # too small for a 4096-token extend). The MoE-side tensors are
+                    # consumed only inside the opaque split op (eager), so fresh
+                    # per-batch allocations there are correct; only THIS info's own
+                    # tensors (read in-graph by dense/embedding LoRA) must persist.
+                    use_cuda_graph=False,
                     num_segments=mb,
                     seg_lens=torch.zeros(mb, dtype=torch.int32),
                     seg_indptr=torch.zeros(mb + 1, dtype=torch.int32),
