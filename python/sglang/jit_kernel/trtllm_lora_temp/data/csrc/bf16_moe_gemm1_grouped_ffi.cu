@@ -6,6 +6,8 @@
 
 #include <cuda_runtime.h>
 
+using tvm::ffi::Optional;
+
 namespace sgl_bf16_fold_p1 {
 char const* run_grouped(
     void const* permuted_hidden,
