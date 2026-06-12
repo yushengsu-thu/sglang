@@ -541,7 +541,10 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                # opt8 fix: was hardcoded None — prepare_lora_batch below does
+                # len(forward_batch.lora_ids) and dies on the [None]*bs path
+                # (never exercised upstream: condition 7 disables piecewise+LoRA).
+                lora_ids=lora_ids,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
         # Setup hooks below read get_attn_backend() and must run inside the
