@@ -388,7 +388,15 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs as _lora_envs
 
     num_tokens = hidden_states.shape[0]
-    drop_act_capture = (
+    # opt7: the in-MoE fold (prefill-only). Requires the dual-layout fold weights and
+    # implies the opt6 activated/map plumbing (the fold has no capture write at all).
+    w_fold = getattr(quant_info, "gemm1_weights_fold", None)
+    use_fold = (
+        _lora_envs.SGLANG_OPT_BF16_MOE_GEMM1_FOLD.get()
+        and w_fold is not None
+        and num_tokens >= 512
+    )
+    drop_act_capture = use_fold or (
         _lora_envs.SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE.get() and num_tokens >= 512
     )
     if drop_act_capture:
@@ -464,6 +472,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
         ),
         activated_out=activated_out,
         expanded_to_permuted_out=expanded_to_permuted,
+        gemm1_weights_fold=(w_fold if use_fold else None),
     )
 
     merged_experts_fused_moe_lora_add(
