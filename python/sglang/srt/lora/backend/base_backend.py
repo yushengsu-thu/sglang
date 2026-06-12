@@ -279,13 +279,17 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             adapter_enabled = None
             token_lora_mapping = None
 
+        # int(): the piecewise-capture batch builds extend_seq_lens_cpu as a CPU
+        # tensor (the scheduler path uses a list) — sum()/max() of it are 0-d
+        # tensors, and triton then specializes the max_len kernel arg as a POINTER
+        # (IncompatibleTypeErrorImpl in tl.cdiv).
         num_tokens = (
-            sum(forward_batch.extend_seq_lens_cpu)
+            int(sum(forward_batch.extend_seq_lens_cpu))
             if forward_batch.forward_mode.is_extend()
             else forward_batch.batch_size
         )
         max_len = (
-            max(forward_batch.extend_seq_lens_cpu)
+            int(max(forward_batch.extend_seq_lens_cpu))
             if forward_batch.forward_mode.is_extend()
             else 1
         )
