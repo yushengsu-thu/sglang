@@ -31,7 +31,18 @@ from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
 
 def is_two_stream_active(x: torch.Tensor) -> bool:
-    """Per-batch gate (two-stream now always-on). True iff batch is decode-shaped (<= SGLANG_TWO_STREAM_MAX_TOKENS)."""
+    """Per-batch gate (two-stream now always-on). True iff batch is decode-shaped (<= SGLANG_TWO_STREAM_MAX_TOKENS).
+
+    opt8: forced False under the piecewise-cuda-graph forward — stream choreography
+    is not expressible in the FX graph (the Stream objects get lifted as external
+    objects, cross split partitions, and kill split_module). Every side-stream
+    forward then falls back to its serial saved-original (same kernels, same math);
+    inside graphed pieces the graph itself already removes the launch gaps.
+    """
+    from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+
+    if get_forward_context() is not None:
+        return False
     return x.shape[0] <= lora_envs.SGLANG_TWO_STREAM_MAX_TOKENS.get()
 
 
