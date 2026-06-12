@@ -436,6 +436,22 @@ def bf16_moe_gemm1_grouped(
     return gate_up_out
 
 
+def bf16_moe_gemm1_fold_gemm(
+    permuted_hidden: torch.Tensor,        # [R_padded, K] bf16
+    w_fold: torch.Tensor,                 # [E, 2I, K] bf16
+    num_tokens_per_expert: torch.Tensor,  # [E] int32
+    perm2exp: torch.Tensor,               # [R_padded] int32 (-1 pad)
+    delta: Optional[torch.Tensor],        # [num_expanded, 2I] bf16 or None
+    tile: int,
+    activated_out: torch.Tensor,          # [R_padded, I] bf16
+) -> torch.Tensor:
+    """opt7 P2: grouped gate_up GEMM with the fused SwiGLU+LoRA fold epilogue."""
+    get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_moe_gemm1_fold_gemm(
+        permuted_hidden, w_fold, num_tokens_per_expert, perm2exp, delta, tile, activated_out
+    )
+    return activated_out
+
+
 def trtllm_fp4_block_scale_routed_moe_lora(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
