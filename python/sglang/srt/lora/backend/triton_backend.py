@@ -257,7 +257,11 @@ class TritonLoRABackend(BaseLoRABackend):
         else:
             max_len = (
                 # Calculate max_len from the CPU copy to avoid D2H transfer.
-                max(forward_batch.extend_seq_lens_cpu)
+                # int(): the piecewise-capture batch builds extend_seq_lens_cpu as a
+                # CPU tensor (the scheduler path uses a list) — max() of it is a 0-d
+                # tensor, which triton then specializes as a POINTER kernel arg and
+                # dies with IncompatibleTypeErrorImpl in cdiv.
+                int(max(forward_batch.extend_seq_lens_cpu))
                 if forward_batch.forward_mode.is_extend()
                 else 1
             )
