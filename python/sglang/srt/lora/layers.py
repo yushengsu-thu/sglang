@@ -1056,11 +1056,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             get_forward_context,
         )
 
-        context = get_forward_context()
+        # NOTE: in traced code read ONLY the none-ness of the context (like
+        # radix_attention does) — touching context.forward_batch here installs
+        # dynamo guards on per-forward objects and causes runtime recompilation
+        # at replay. The piecewise context is extend-only by construction.
         if (
-            context is not None
+            get_forward_context() is not None
             and self._lora_runner_backend.is_experimental_sgl_trtllm()
-            and context.forward_batch.forward_mode.is_extend()
         ):
             from sglang.srt.lora.trtllm_lora_temp.piecewise_split import (
                 unified_moe_lora_with_output,
