@@ -44,6 +44,7 @@ class Sm100BF16FoldArrayEpilogue {
   using ThreadEpilogueOp =
       cutlass::epilogue::thread::LinearCombination<ElementD_, 1, ElementAccumulator_, float>;
   using CtaTileShapeMNK = CtaTileShapeMNK_;
+  using EpilogueTile = decltype(cute::take<0, 2>(CtaTileShapeMNK_{}));
   using ElementAccumulator = ElementAccumulator_;
   using ElementCompute = float;
   using ElementScalar = float;

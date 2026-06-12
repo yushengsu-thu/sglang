@@ -122,8 +122,12 @@ __global__ void buildGroupArgsKernel(
 }
 
 // ---- P2: fold-epilogue GEMM (same mainloop, half-width D + SwiGLU/LoRA fold) ----
-using FoldEpilogue = sgl_bf16_fold::Sm100BF16FoldArrayEpilogue<
+// Wrap in the same adapter the stock builder applies for the WarpSpecialized NoSmem path:
+// it supplies the Load/Store pipeline interface the sm100 array kernel requires.
+using FoldEpilogueCore = sgl_bf16_fold::Sm100BF16FoldArrayEpilogue<
     TileShape, ElementAcc, ElementD, StrideD*, typename CollectiveEpilogue::CopyOpT2R>;
+using FoldEpilogue =
+    cutlass::epilogue::collective::detail::Sm100TmaWarpSpecializedAdapter<FoldEpilogueCore>;
 using GemmKernelFold = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, FoldEpilogue>;
 using GemmFold = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelFold>;
 
