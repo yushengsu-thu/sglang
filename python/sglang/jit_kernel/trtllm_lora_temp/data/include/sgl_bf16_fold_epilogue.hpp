@@ -76,6 +76,8 @@ class Sm100BF16FoldArrayEpilogue {
     int const** ptr_perm2exp = nullptr;  // per-group: group-local permuted row -> expanded idx (-1 pad)
     ElementD const* delta = nullptr;     // [num_expanded, 2I] half-contiguous LoRA delta (nullable)
     int inner_dim = 0;                   // I = N/2
+    int num_expanded = 0;                // bound for perm2exp values (pad rows hold GARBAGE,
+                                         // not -1: routing never writes them — must bound-check)
   };
   using Params = Arguments;
 
@@ -189,6 +191,7 @@ class Sm100BF16FoldArrayEpilogue {
       if (m != last_m) {
         last_m = m;
         last_x = (m < int(M)) ? perm2exp[m] : -1;
+        if (last_x < 0 || last_x >= params.num_expanded) last_x = -1;  // pad rows = garbage
       }
       if (last_x < 0 || m >= int(M)) {
         continue;  // padding row or OOB: leave D garbage (same contract as base path)
@@ -231,8 +234,8 @@ class Sm100BF16FoldArrayEpilogue {
           int const mj = int(get<0>(cj));
           int const nj = int(get<1>(cj));
           if (mj >= int(M) || nj + 1 >= int(N) || (nj & 1)) continue;
-          int const xj = (mj == m) ? last_x : perm2exp[mj];
-          if (xj < 0) continue;
+          int xj = (mj == m) ? last_x : perm2exp[mj];
+          if (xj < 0 || xj >= params.num_expanded) continue;
           int const h = nj >> 1;
           float x1 = float(frag(u + j));
           float x2 = float(frag(u + j + 1));

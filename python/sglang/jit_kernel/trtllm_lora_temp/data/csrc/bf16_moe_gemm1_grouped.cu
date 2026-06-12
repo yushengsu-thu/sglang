@@ -200,6 +200,7 @@ char const* run_grouped_fold(
     int N,                      // full width 2I
     int K,
     int tile,
+    int num_expanded,           // num_tokens * top_k (bound for perm2exp garbage at pad rows)
     void* activated_out,        // [R_padded, I]
     cudaStream_t stream) {
   auto align16 = [](size_t x) { return (x + 15) & ~size_t(15); };
@@ -240,7 +241,7 @@ char const* run_grouped_fold(
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {E, shapes, /*host_problem_shapes=*/nullptr},
       {ptrA, sA, ptrB, sB},
-      {ptrDh, sDh, ptrP2E, static_cast<ElementD const*>(delta), N / 2},
+      {ptrDh, sDh, ptrP2E, static_cast<ElementD const*>(delta), N / 2, num_expanded},
       hw_info,
   };
 

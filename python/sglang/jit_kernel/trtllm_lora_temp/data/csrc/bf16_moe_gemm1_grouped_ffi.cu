@@ -31,6 +31,7 @@ char const* run_grouped_fold(
     int N,
     int K,
     int tile,
+    int num_expanded,
     void* activated_out,
     cudaStream_t stream);
 }
@@ -132,6 +133,7 @@ void sgl_bf16_moe_gemm1_fold_gemm(
       static_cast<int const*>(perm2exp.data_ptr()),
       delta_ptr,
       E, N, K, static_cast<int>(tile),
+      delta.has_value() ? static_cast<int>(delta.value().numel() / N) : (1 << 30),
       activated_out.data_ptr(),
       stream);
   TVM_FFI_ICHECK(err == nullptr) << "bf16 fold GEMM failed: " << err;

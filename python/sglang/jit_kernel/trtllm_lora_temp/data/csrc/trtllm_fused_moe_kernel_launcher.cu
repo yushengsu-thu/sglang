@@ -33,7 +33,8 @@ namespace sgl_bf16_fold_p1 {
 char const* run_grouped_fold(void const* permuted_hidden, void const* w_fold,
                              int const* cta_to_local_expert, int const* num_non_exiting_ctas,
                              int const* perm2exp, void const* delta, int E, int N,
-                             int K, int tile, void* activated_out, cudaStream_t stream);
+                             int K, int tile, int num_expanded, void* activated_out,
+                             cudaStream_t stream);
 }
 #include <algorithm>
 #include <cmath>
@@ -3616,6 +3617,7 @@ class Bf16LoraLauncher {
           static_cast<int>(gate_up_n),
           static_cast<int>(hidden_size),
           static_cast<int>(tile),
+          static_cast<int>(num_tokens * top_k),
           activated_ptr,
           stream);
       TVM_FFI_ICHECK(fold_err == nullptr) << "bf16 fold pipeline failed: " << fold_err;
