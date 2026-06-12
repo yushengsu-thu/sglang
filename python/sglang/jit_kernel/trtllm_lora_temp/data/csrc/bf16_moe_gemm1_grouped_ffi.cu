@@ -26,6 +26,7 @@ char const* run_grouped_fold(
     int const* perm2exp,
     void const* delta,
     int E,
+    int local_expert_offset,
     int N,
     int K,
     int tile,
@@ -111,7 +112,7 @@ void sgl_bf16_moe_gemm1_fold_gemm(
       static_cast<int const*>(num_tokens_per_expert.data_ptr()),
       static_cast<int const*>(perm2exp.data_ptr()),
       delta_ptr,
-      E, N, K, static_cast<int>(tile),
+      E, /*local_expert_offset=*/0, N, K, static_cast<int>(tile),
       activated_out.data_ptr(),
       stream);
   TVM_FFI_ICHECK(err == nullptr) << "bf16 fold GEMM failed: " << err;

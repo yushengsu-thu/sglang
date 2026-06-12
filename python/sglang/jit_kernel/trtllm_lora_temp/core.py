@@ -331,6 +331,7 @@ def trtllm_bf16_routed_moe_lora(
     gemm2_done_event: int = 0,
     activated_out: Optional[torch.Tensor] = None,
     expanded_to_permuted_out: Optional[torch.Tensor] = None,
+    gemm1_weights_fold: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE-LoRA: decomposed trtllm pipeline (permute -> raw gate_up GEMM ->
     LoRA-aware activation -> down GEMM), bf16 end-to-end (no quantization).
@@ -387,6 +388,7 @@ def trtllm_bf16_routed_moe_lora(
         gemm2_done_event,
         activated_out,
         expanded_to_permuted_out,
+        gemm1_weights_fold,
     )
 
     return output if do_finalize else result

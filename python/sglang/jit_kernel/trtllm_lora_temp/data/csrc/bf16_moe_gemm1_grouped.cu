@@ -135,7 +135,8 @@ using GemmFold = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelFold>;
 // per-group perm2exp segment pointers for the fold epilogue.
 __global__ void buildGroupArgsFoldKernel(
     int const* __restrict__ num_tokens_per_expert,
-    int E,
+    int E,                // GLOBAL expert count (groups; non-local counts are 0 => empty groups)
+    int local_expert_offset,
     int tile,
     int N,            // full interleaved width (2I)
     int K,
@@ -156,10 +157,11 @@ __global__ void buildGroupArgsFoldKernel(
   int64_t off = 0;
   for (int e = 0; e < E; ++e) {
     int const cnt = num_tokens_per_expert[e];
-    int const m = ((cnt + tile - 1) / tile) * tile;
+    int const m = ((cnt + tile - 1) / tile) * tile;   // matches routing: tile-aligned cumsum over GLOBAL experts (non-local counts are zeroed by routing)
+    int const le = e - local_expert_offset;           // weight index; only valid when cnt>0
     shapes[e] = UnderlyingShape{m, N, K};
     ptrA[e] = A_base + off * K;
-    ptrB[e] = B_base + (int64_t)e * N * K;
+    ptrB[e] = B_base + (int64_t)((le >= 0) ? le : 0) * N * K;
     ptrDh[e] = Dh_base + off * I;
     ptrP2E[e] = perm2exp_base + off;
     sA[e] = cutlass::make_cute_packed_stride(StrideA{}, {m, K, 1});
@@ -176,7 +178,8 @@ char const* run_grouped_fold(
     int const* num_tokens_per_expert,
     int const* perm2exp,        // [R_padded] permuted row -> expanded idx (-1 pad)
     void const* delta,          // [num_expanded, 2I] half-contiguous, or nullptr
-    int E,
+    int E,                      // GLOBAL expert count (group count)
+    int local_expert_offset,    // weight index base (w_fold holds LOCAL experts only)
     int N,                      // full width 2I
     int K,
     int tile,
@@ -204,7 +207,7 @@ char const* run_grouped_fold(
   auto* sDh = reinterpret_cast<StrideD*>(base + o_sd);
 
   buildGroupArgsFoldKernel<<<1, 32, 0, stream>>>(
-      num_tokens_per_expert, E, tile, N, K,
+      num_tokens_per_expert, E, local_expert_offset, tile, N, K,
       static_cast<ElementA const*>(permuted_hidden),
       static_cast<ElementB const*>(w_fold),
       static_cast<ElementD*>(activated_out),
