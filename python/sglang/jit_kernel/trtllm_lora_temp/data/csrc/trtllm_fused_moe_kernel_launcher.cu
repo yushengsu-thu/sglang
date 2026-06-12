@@ -2848,15 +2848,6 @@ class FP4BlockScaleLoraLauncher {
     Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, device);
     Tensor expanded_idx_to_permuted_idx = alloc_tensor({num_tokens * top_k}, dl_int32, device);
     Tensor permuted_idx_to_token_idx = alloc_tensor({max_num_padded_tokens}, dl_int32, device);
-    // opt7 fold: the fold epilogue gathers the LoRA delta per permuted row, so it needs the
-    // inverse map (permuted -> expanded). Routing fills it when requested.
-    bool const use_fold = gemm1_weights_fold_.has_value() && activated_out_.has_value();
-    Tensor permuted_idx_to_expanded_idx;
-    int* permuted_idx_to_expanded_ptr = nullptr;
-    if (use_fold) {
-      permuted_idx_to_expanded_idx = alloc_tensor({max_num_padded_tokens}, dl_int32, device);
-      permuted_idx_to_expanded_ptr = static_cast<int*>(permuted_idx_to_expanded_idx.data_ptr());
-    }
     int64_t const hist_size = std::max<int64_t>(num_experts * 2, 256 * 2);
     Tensor expert_count_histogram = alloc_tensor({hist_size}, dl_int32, device);
     int32_t max_num_ctas = moe_ns::Routing::getMaxNumCtasInBatchDim(num_tokens, top_k, num_experts, tile_tokens_dim);
@@ -2893,7 +2884,7 @@ class FP4BlockScaleLoraLauncher {
         static_cast<int*>(expert_count_histogram.data_ptr()),
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-        permuted_idx_to_expanded_ptr,
+        /*permuted_idx_to_expanded_idx=*/nullptr,
         static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
         expert_weights_ptr,
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
