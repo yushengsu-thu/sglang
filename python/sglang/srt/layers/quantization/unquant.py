@@ -296,6 +296,33 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 get_w2_permute_indices_with_cache,
             )
 
+            # opt7 (bf16 LoRA in-MoE fold, SGLANG_OPT_BF16_MOE_DUAL_LAYOUT): keep a plain
+            # INTERLEAVED [E, 2I, K] copy of w13 before the trtllm shuffle. We apply ONLY
+            # the gated-act interleave permutation (the same one the trtllm prepare bakes
+            # into its combined permute), so the fold GEMM's output-column order matches
+            # the trtllm pipeline's exactly. bf16-only; +2*I*K*2B per expert of HBM.
+            try:
+                from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs as _le
+
+                _want_fold_copy = (
+                    _le.SGLANG_OPT_BF16_MOE_DUAL_LAYOUT.get()
+                    and layer.w13_weight.data.dtype == torch.bfloat16
+                )
+            except Exception:
+                _want_fold_copy = False
+            if _want_fold_copy:
+                from flashinfer.fused_moe.core import (
+                    get_reorder_rows_for_gated_act_gemm_row_indices,
+                )
+
+                _fold_idx = get_reorder_rows_for_gated_act_gemm_row_indices(
+                    layer.w13_weight.data[0]
+                ).to(layer.w13_weight.data.device)
+                layer.w13_weight_fold = torch.nn.Parameter(
+                    layer.w13_weight.data[:, _fold_idx, :].contiguous(),
+                    requires_grad=False,
+                )
+
             # w1 and w3 have been swapped, so we don't need do that here
             epilogue_tile_m = 128
             block_k = 128

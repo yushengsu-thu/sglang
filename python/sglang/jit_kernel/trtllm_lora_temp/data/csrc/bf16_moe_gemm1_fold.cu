@@ -106,6 +106,28 @@ __global__ void gatherRowsKernel(
   }
 }
 
+// Plain-CUDA launch helper, callable from launcher.cu (P4 integration).
+void launch_gather_rows(
+    void const* hidden,
+    int const* row2token,
+    void* out,
+    int64_t R,
+    int64_t K,
+    int64_t num_tokens,
+    cudaStream_t stream) {
+  int64_t const total = R * (K / 8);
+  int const threads = 256;
+  int64_t const want = (total + threads - 1) / threads;
+  int const blocks = static_cast<int>(want < 65535 ? want : 65535);
+  gatherRowsKernel<<<blocks, threads, 0, stream>>>(
+      static_cast<__nv_bfloat16 const*>(hidden),
+      row2token,
+      static_cast<__nv_bfloat16*>(out),
+      R,
+      K,
+      num_tokens);
+}
+
 }  // namespace sgl_bf16_fold
 
 // ---- FFI ----
