@@ -82,6 +82,30 @@ __global__ void foldRefKernel(
   }
 }
 
+// P3: properly-gridded row gather (replaces moe::dev::permute on the bf16 fold path).
+// The dev permute kernel launches a decode-shaped tiny grid (128 blocks, 11% occupancy at
+// prefill shapes -> 180 us/layer for ~8 us of HBM traffic). This is a plain bandwidth-bound
+// gather: out[r, :] = hidden[row2token[r], :] for valid rows, 16B vectorized, flat grid.
+__global__ void gatherRowsKernel(
+    __nv_bfloat16 const* __restrict__ hidden,  // [num_tokens, K]
+    int const* __restrict__ row2token,         // [R] (-1 or OOB => skip row)
+    __nv_bfloat16* __restrict__ out,           // [R, K]
+    int64_t R,
+    int64_t K,
+    int64_t num_tokens) {
+  int64_t const vecs_per_row = K / 8;  // 8 x bf16 = 16B
+  int64_t const total = R * vecs_per_row;
+  for (int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; idx < total;
+       idx += (int64_t)gridDim.x * blockDim.x) {
+    int64_t const r = idx / vecs_per_row;
+    int64_t const v = idx % vecs_per_row;
+    int const t = row2token[r];
+    if (t < 0 || t >= num_tokens) continue;  // padding rows stay garbage (base contract)
+    reinterpret_cast<uint4*>(out + r * K)[v] =
+        reinterpret_cast<uint4 const*>(hidden + (int64_t)t * K)[v];
+  }
+}
+
 }  // namespace sgl_bf16_fold
 
 // ---- FFI ----
@@ -141,5 +165,35 @@ void sgl_bf16_moe_gemm1_fold_ref(
       K);
 }
 
+// P3 gather: out[r,:] = hidden[row2token[r],:] (K % 8 == 0; 16B vectorized).
+void sgl_bf16_gather_rows(
+    TensorView hidden,        // [num_tokens, K] bf16
+    TensorView row2token,     // [R] int32
+    TensorView out) {         // [R, K] bf16
+  TVM_FFI_ICHECK_EQ(hidden.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(out.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(row2token.dtype(), dl_int32);
+  TVM_FFI_ICHECK(hidden.ndim() == 2 && out.ndim() == 2);
+  TVM_FFI_ICHECK(hidden.IsContiguous() && out.IsContiguous() && row2token.IsContiguous());
+  int64_t const K = hidden.size(1);
+  int64_t const R = out.size(0);
+  TVM_FFI_ICHECK_EQ(out.size(1), K);
+  TVM_FFI_ICHECK_EQ(K % 8, 0) << "K must be a multiple of 8 (16B vectorized gather).";
+  TVM_FFI_ICHECK_EQ(row2token.numel(), R);
+  auto device = hidden.device();
+  cudaStream_t stream = get_stream(device);
+  int64_t const total = R * (K / 8);
+  int const threads = 256;
+  int const blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+  sgl_bf16_fold::gatherRowsKernel<<<blocks, threads, 0, stream>>>(
+      static_cast<__nv_bfloat16 const*>(hidden.data_ptr()),
+      static_cast<int const*>(row2token.data_ptr()),
+      static_cast<__nv_bfloat16*>(out.data_ptr()),
+      R,
+      K,
+      hidden.size(0));
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_bf16_fold_probe, sgl_bf16_fold_probe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_bf16_gather_rows, sgl_bf16_gather_rows);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_bf16_moe_gemm1_fold_ref, sgl_bf16_moe_gemm1_fold_ref);
