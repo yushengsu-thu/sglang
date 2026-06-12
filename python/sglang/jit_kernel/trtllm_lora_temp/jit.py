@@ -67,6 +67,11 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
             overlay_csrc_dir / "trtllm_fused_moe_runner.cu",
             # opt7 (bf16 in-MoE fold) skeleton: CUTLASS probe + P0 reference fold kernel.
             overlay_csrc_dir / "bf16_moe_gemm1_fold.cu",
+            # opt7 P1: CUTLASS Sm100 grouped gate_up GEMM (plain epilogue) + its FFI shell
+            # (separate TUs: tvm-ffi's global `Tensor` clashes with cute::Tensor in CUTLASS
+            # epilogue headers at instantiation time).
+            overlay_csrc_dir / "bf16_moe_gemm1_grouped.cu",
+            overlay_csrc_dir / "bf16_moe_gemm1_grouped_ffi.cu",
             flashinfer_csrc_dir
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
             flashinfer_csrc_dir
