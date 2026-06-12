@@ -315,7 +315,7 @@ def trtllm_bf16_routed_moe_lora(
     gemm1_weights: torch.Tensor,
     gemm2_weights: torch.Tensor,
     gate_up_lora_delta: torch.Tensor,
-    activation_lora_input: torch.Tensor,
+    activation_lora_input: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     intermediate_size: int,
@@ -329,6 +329,9 @@ def trtllm_bf16_routed_moe_lora(
     activation_type: Optional[int] = None,
     lora_ready_event: int = 0,
     gemm2_done_event: int = 0,
+    activated_out: Optional[torch.Tensor] = None,
+    expanded_to_permuted_out: Optional[torch.Tensor] = None,
+    gemm1_weights_fold: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE-LoRA: decomposed trtllm pipeline (permute -> raw gate_up GEMM ->
     LoRA-aware activation -> down GEMM), bf16 end-to-end (no quantization).
@@ -336,7 +339,13 @@ def trtllm_bf16_routed_moe_lora(
     (shuffled + BlockMajorK). With do_finalize=False returns
     (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) for the
     python-side down-LoRA delta + trtllm_fp8_block_scale_moe_lora_finalize
-    (which is pure bf16 and shared across fp8/fp4/bf16)."""
+    (which is pure bf16 and shared across fp8/fp4/bf16).
+
+    opt6: pass ``activation_lora_input=None`` with ``activated_out`` (contiguous
+    [>=max_padded, inter] bf16) + ``expanded_to_permuted_out`` (int32
+    [num_tokens*top_k]) to skip the redundant expanded-layout side-capture; the
+    down-LoRA shrink then reads ``activated_out`` via the row map (bf16-only —
+    fp8/fp4 *need* the capture because their activated output is quantized)."""
     from flashinfer.fused_moe.core import ActivationType
     from flashinfer.utils import device_support_pdl
 
@@ -350,7 +359,10 @@ def trtllm_bf16_routed_moe_lora(
         )
 
     assert gate_up_lora_delta.is_contiguous()
-    assert activation_lora_input.is_contiguous()
+    if activation_lora_input is not None:
+        assert activation_lora_input.is_contiguous()
+    else:
+        assert activated_out is not None and expanded_to_permuted_out is not None
 
     result = get_sgl_trtllm_moe_sm100_raw_module().sgl_trtllm_bf16_routed_moe_lora(
         topk_ids,
@@ -374,9 +386,82 @@ def trtllm_bf16_routed_moe_lora(
         activation_lora_input,
         lora_ready_event,
         gemm2_done_event,
+        activated_out,
+        expanded_to_permuted_out,
+        gemm1_weights_fold,
     )
 
     return output if do_finalize else result
+
+
+def bf16_fold_probe() -> list:
+    """opt7: returns [CUTLASS_MAJOR, CUTLASS_MINOR, 1] — proves the CUTLASS include path
+    is wired into this JIT module (prerequisite for the P1 grouped GEMM)."""
+    return list(get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_fold_probe())
+
+
+def bf16_moe_gemm1_fold_ref(
+    hidden: torch.Tensor,                    # [num_tokens, K] bf16
+    w_fold: torch.Tensor,                    # [E, 2I, K] bf16 (interleaved g/u columns)
+    gate_up_lora_delta: Optional[torch.Tensor],  # [num_expanded, 2I] bf16 or None
+    permuted_row_to_token: torch.Tensor,     # [R] int32
+    permuted_row_to_expanded: torch.Tensor,  # [R] int32
+    permuted_row_to_expert: torch.Tensor,    # [R] int32 (-1 = padding)
+    activated_out: torch.Tensor,             # [R, I] bf16 (output)
+) -> torch.Tensor:
+    """opt7 P0: naive reference fold kernel (gather + interleaved gate/up GEMM +
+    half-contiguous LoRA delta + SwiGLU). Correctness baseline only — never serving."""
+    get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_moe_gemm1_fold_ref(
+        hidden,
+        w_fold,
+        gate_up_lora_delta,
+        permuted_row_to_token,
+        permuted_row_to_expanded,
+        permuted_row_to_expert,
+        activated_out,
+    )
+    return activated_out
+
+
+def bf16_moe_gemm1_grouped(
+    permuted_hidden: torch.Tensor,        # [R_padded, K] bf16 (tile-padded expert segments)
+    w_fold: torch.Tensor,                 # [E, N=2I, K] bf16
+    num_tokens_per_expert: torch.Tensor,  # [E] int32 (real counts)
+    tile: int,
+    gate_up_out: torch.Tensor,            # [R_padded, N] bf16 (output)
+) -> torch.Tensor:
+    """opt7 P1: CUTLASS Sm100 grouped gate_up GEMM (plain epilogue, pre-permuted A).
+    Parity-gate candidate vs the tuned bmm_Bfloat16 cubin; not a serving path yet."""
+    get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_moe_gemm1_grouped(
+        permuted_hidden, w_fold, num_tokens_per_expert, tile, gate_up_out
+    )
+    return gate_up_out
+
+
+def bf16_gather_rows(
+    hidden: torch.Tensor,     # [num_tokens, K] bf16
+    row2token: torch.Tensor,  # [R] int32 (-1 = padding, skipped)
+    out: torch.Tensor,        # [R, K] bf16
+) -> torch.Tensor:
+    """opt7 P3: bandwidth-bound row gather (replaces moe::dev::permute on the fold path)."""
+    get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_gather_rows(hidden, row2token, out)
+    return out
+
+
+def bf16_moe_gemm1_fold_gemm(
+    permuted_hidden: torch.Tensor,        # [R_padded, K] bf16
+    w_fold: torch.Tensor,                 # [E, 2I, K] bf16
+    num_tokens_per_expert: torch.Tensor,  # [E] int32
+    perm2exp: torch.Tensor,               # [R_padded] int32 (-1 pad)
+    delta: Optional[torch.Tensor],        # [num_expanded, 2I] bf16 or None
+    tile: int,
+    activated_out: torch.Tensor,          # [R_padded, I] bf16
+) -> torch.Tensor:
+    """opt7 P2: grouped gate_up GEMM with the fused SwiGLU+LoRA fold epilogue."""
+    get_sgl_trtllm_moe_sm100_raw_module().sgl_bf16_moe_gemm1_fold_gemm(
+        permuted_hidden, w_fold, num_tokens_per_expert, perm2exp, delta, tile, activated_out
+    )
+    return activated_out
 
 
 def trtllm_fp4_block_scale_routed_moe_lora(

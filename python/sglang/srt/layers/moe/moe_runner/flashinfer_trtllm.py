@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 from torch.nn import Module
@@ -1049,6 +1049,10 @@ class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
     # Expert-parallel metadata
     global_num_experts: int
     local_expert_offset: int
+
+    # opt7 (bf16 LoRA in-MoE fold): plain interleaved [E, 2I, K] gemm1 copy for the
+    # prefill CUTLASS fold GEMM (SGLANG_OPT_BF16_MOE_DUAL_LAYOUT). None when disabled.
+    gemm1_weights_fold: Optional[torch.Tensor] = None
 
 
 def fused_experts_none_to_flashinfer_trtllm_bf16(

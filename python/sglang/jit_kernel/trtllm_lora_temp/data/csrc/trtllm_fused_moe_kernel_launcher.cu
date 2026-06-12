@@ -23,6 +23,19 @@
 #include "nv_internal/tensorrt_llm/kernels/quantization.h"
 #include "nv_internal/tensorrt_llm/thop/utils.h"
 #include "tvm_ffi_utils.h"
+
+// opt7 P4: fold pipeline entries (defined in bf16_moe_gemm1_fold.cu / bf16_moe_gemm1_grouped.cu)
+namespace sgl_bf16_fold {
+void launch_gather_rows(void const* hidden, int const* row2token, void* out,
+                        int64_t R, int64_t K, int64_t num_tokens, cudaStream_t stream);
+}
+namespace sgl_bf16_fold_p1 {
+char const* run_grouped_fold(void const* permuted_hidden, void const* w_fold,
+                             int const* cta_to_local_expert, int const* num_non_exiting_ctas,
+                             int const* perm2exp, void const* delta, int E, int N,
+                             int K, int tile, int num_expanded, void* activated_out,
+                             cudaStream_t stream);
+}
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -3440,10 +3453,13 @@ class Bf16LoraLauncher {
       TensorView const& gemm1_weights,
       TensorView const& gemm2_weights,
       TensorView const& gate_up_lora_delta,
-      TensorView const& activation_lora_input,
+      Optional<TensorView> const& activation_lora_input,
       TensorView const& output,
       int64_t lora_ready_event,
-      int64_t gemm2_done_event)
+      int64_t gemm2_done_event,
+      Optional<TensorView> const& activated_out,
+      Optional<TensorView> const& expanded_to_permuted_out,
+      Optional<TensorView> const& gemm1_weights_fold)
       : expert_indices_(expert_indices),
         routing_bias_(routing_bias),
         hidden_states_(hidden_states),
@@ -3453,7 +3469,10 @@ class Bf16LoraLauncher {
         activation_lora_input_(activation_lora_input),
         output_(output),
         lora_ready_event_(lora_ready_event),
-        gemm2_done_event_(gemm2_done_event) {}
+        gemm2_done_event_(gemm2_done_event),
+        activated_out_(activated_out),
+        expanded_to_permuted_out_(expanded_to_permuted_out),
+        gemm1_weights_fold_(gemm1_weights_fold) {}
 
   // Returns {output} when do_finalize, else {gemm2_output, expert_weights,
   // expanded_idx_to_permuted_idx} for a downstream finalize kernel.
@@ -3486,6 +3505,15 @@ class Bf16LoraLauncher {
     Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, device);
     Tensor expanded_idx_to_permuted_idx = alloc_tensor({num_tokens * top_k}, dl_int32, device);
     Tensor permuted_idx_to_token_idx = alloc_tensor({max_num_padded_tokens}, dl_int32, device);
+    // opt7 fold: the fold epilogue gathers the LoRA delta per permuted row, so it needs the
+    // inverse map (permuted -> expanded). Routing fills it when requested.
+    bool const use_fold = gemm1_weights_fold_.has_value() && activated_out_.has_value();
+    Tensor permuted_idx_to_expanded_idx;
+    int* permuted_idx_to_expanded_ptr = nullptr;
+    if (use_fold) {
+      permuted_idx_to_expanded_idx = alloc_tensor({max_num_padded_tokens}, dl_int32, device);
+      permuted_idx_to_expanded_ptr = static_cast<int*>(permuted_idx_to_expanded_idx.data_ptr());
+    }
     int64_t const hist_size = std::max<int64_t>(num_experts * 2, 256 * 2);
     Tensor expert_count_histogram = alloc_tensor({hist_size}, dl_int32, device);
     int32_t max_num_ctas = moe_ns::Routing::getMaxNumCtasInBatchDim(num_tokens, top_k, num_experts, tile_tokens_dim);
@@ -3516,7 +3544,7 @@ class Bf16LoraLauncher {
         static_cast<int*>(expert_count_histogram.data_ptr()),
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-        /*permuted_idx_to_expanded_idx=*/nullptr,
+        permuted_idx_to_expanded_ptr,
         static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
         expert_weights_ptr,
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
@@ -3533,8 +3561,67 @@ class Bf16LoraLauncher {
         norm_topk_prob,
         /*routing_replay_out=*/nullptr);
 
+    // opt6: export the expanded->permuted row map so the python-side down-LoRA
+    // shrink can read the permuted activated buffer directly (D2D, 4B/expanded-row).
+    if (expanded_to_permuted_out_.has_value()) {
+      cudaMemcpyAsync(
+          expanded_to_permuted_out_.value().data_ptr(),
+          expanded_idx_to_permuted_idx.data_ptr(),
+          sizeof(int32_t) * num_tokens * top_k,
+          cudaMemcpyDeviceToDevice,
+          stream);
+    }
+
     int64_t const tile = tile_tokens_dim;
 
+    // opt6: when the caller provides a (permuted-layout) activated buffer, write the
+    // activation output there and skip the redundant expanded-layout side-capture —
+    // for bf16 both hold the same values (no output scale, unlike fp8/fp4).
+    Tensor activated_bf16;
+    void* activated_ptr = nullptr;
+    if (activated_out_.has_value()) {
+      TVM_FFI_ICHECK(activated_out_.value().size(0) >= max_num_padded_tokens)
+          << "activated_out rows < max_num_padded_tokens (" << max_num_padded_tokens << ")";
+      activated_ptr = activated_out_.value().data_ptr();
+    } else {
+      activated_bf16 = alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
+      activated_ptr = activated_bf16.data_ptr();
+    }
+
+    if (use_fold) {
+      // ---- opt7 fold path: gather -> grouped GEMM w/ fused SwiGLU+LoRA epilogue ----
+      // Replaces permute + gate_up GEMM + activation (101.5us vs 270us at per-rank
+      // prefill shapes). gate_up never exists; activated is the only intermediate.
+      Tensor permuted_hidden_bf16 =
+          alloc_tensor({max_num_padded_tokens, hidden_size}, dl_bfloat16, device);
+      sgl_bf16_fold::launch_gather_rows(
+          hidden_states_.data_ptr(),
+          static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+          permuted_hidden_bf16.data_ptr(),
+          max_num_padded_tokens,
+          hidden_size,
+          num_tokens,
+          stream);
+      // The fold epilogue consumes the side-stream LoRA delta: wait before the GEMM.
+      if (lora_ready_event_ != 0) {
+        cudaStreamWaitEvent(stream, reinterpret_cast<cudaEvent_t>(lora_ready_event_), 0);
+      }
+      char const* fold_err = sgl_bf16_fold_p1::run_grouped_fold(
+          permuted_hidden_bf16.data_ptr(),
+          gemm1_weights_fold_.value().data_ptr(),
+          static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+          static_cast<int*>(num_non_exiting_ctas.data_ptr()),
+          permuted_idx_to_expanded_ptr,
+          gate_up_lora_delta_.data_ptr(),
+          static_cast<int>(local_num_experts),
+          static_cast<int>(gate_up_n),
+          static_cast<int>(hidden_size),
+          static_cast<int>(tile),
+          static_cast<int>(num_tokens * top_k),
+          activated_ptr,
+          stream);
+      TVM_FFI_ICHECK(fold_err == nullptr) << "bf16 fold pipeline failed: " << fold_err;
+    } else {
     // ---- 2+3) permute (gather) bf16 hidden + gate_up GEMM ----
     // The permuted gather buffer ([max_padded, hidden] bf16) lives only inside this block: it
     // frees right after the gate_up GEMM is enqueued (stream-ordered caching allocator), before
@@ -3626,7 +3713,6 @@ class Bf16LoraLauncher {
     };
     static int const actOptMode = envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC") ? 1 : 0;
 
-    Tensor activated_bf16 = alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
     {
       moe::dev::activation::Data actData;
       actData.mDtypeElt = btg::Dtype::Bfloat16;
@@ -3634,11 +3720,14 @@ class Bf16LoraLauncher {
       actData.mUseDeepSeekFp8 = false;
       actData.inPtr = gate_up_bf16.data_ptr();
       actData.interleavedGateUpInput = true;
-      actData.outPtr = activated_bf16.data_ptr();
+      actData.outPtr = activated_ptr;
       actData.inDqSfsPtr = nullptr;
       actData.outDqSfsPtr = nullptr;
       actData.gateUpLoraDeltaPtr = static_cast<cutlass::bfloat16_t const*>(gate_up_lora_delta_.data_ptr());
-      actData.activationLoraInputOutPtr = static_cast<cutlass::bfloat16_t*>(activation_lora_input_.data_ptr());
+      actData.activationLoraInputOutPtr =
+          activation_lora_input_.has_value()
+              ? static_cast<cutlass::bfloat16_t*>(activation_lora_input_.value().data_ptr())
+              : nullptr;
       actData.innerDim = gate_up_n;
       actData.numTokens = num_tokens;
       actData.topK = top_k;
@@ -3647,6 +3736,7 @@ class Bf16LoraLauncher {
       actData.actOptMode = actOptMode;
       moe::dev::activation::run(actData, stream);
     }
+    }  // end !use_fold
 
     // ---- 5) down GEMM: Gemm2::Runner(Bf16,Bf16,Bf16, K=inter, N=hidden) ----
     Tensor gemm2_output = alloc_tensor({max_num_padded_tokens, hidden_size}, dl_bfloat16, device);
@@ -3665,7 +3755,7 @@ class Bf16LoraLauncher {
       size_t ws = gemm_down.getWorkspaceSizeInBytes(top_k, hidden_size, inter, local_num_experts, num_tokens, cfg);
       Tensor gemm_ws = alloc_tensor({(int64_t)ws}, dl_int8, device);
       gemm_down.run(
-          activated_bf16.data_ptr(),
+          activated_ptr,
           /*hiddenStateScale=*/nullptr,
           gemm2_weights_.data_ptr(),
           /*weightScale=*/nullptr,
@@ -3733,8 +3823,11 @@ class Bf16LoraLauncher {
   TensorView gemm1_weights_;
   TensorView gemm2_weights_;
   TensorView gate_up_lora_delta_;
-  TensorView activation_lora_input_;
+  Optional<TensorView> activation_lora_input_;
   TensorView output_;
+  Optional<TensorView> activated_out_;
+  Optional<TensorView> expanded_to_permuted_out_;
+  Optional<TensorView> gemm1_weights_fold_;
   int64_t lora_ready_event_ = 0;
   int64_t gemm2_done_event_ = 0;
 };
@@ -3758,12 +3851,24 @@ Array<Tensor> sgl_trtllm_bf16_routed_moe_lora(
     TensorView output,
     bool norm_topk_prob,
     TensorView gate_up_lora_delta,
-    TensorView activation_lora_input,
+    Optional<TensorView> activation_lora_input,
     int64_t lora_ready_event,
-    int64_t gemm2_done_event) {
+    int64_t gemm2_done_event,
+    Optional<TensorView> activated_out,
+    Optional<TensorView> expanded_to_permuted_out,
+    Optional<TensorView> gemm1_weights_fold) {
   auto activation_type = validateAndCastActivationType(act_type);
   TVM_FFI_ICHECK(isGatedActivation(activation_type))
       << "sgl_trtllm_bf16_routed_moe_lora currently supports gated (SwiGLU) activation only.";
+  if (gemm1_weights_fold.has_value()) {
+    TVM_FFI_ICHECK(gemm1_weights_fold.value().dtype() == dl_bfloat16 &&
+                   gemm1_weights_fold.value().ndim() == 3 &&
+                   gemm1_weights_fold.value().size(1) == 2 * intermediate_size &&
+                   gemm1_weights_fold.value().IsContiguous())
+        << "gemm1_weights_fold must be contiguous bf16 [E_local, 2*inter, hidden].";
+    TVM_FFI_ICHECK(activated_out.has_value() && expanded_to_permuted_out.has_value())
+        << "the fold path requires activated_out + expanded_to_permuted_out (opt6 plumbing).";
+  }
 
   // Precomputed routing is required (packed topk_ids).
   TVM_FFI_ICHECK(expert_indices.ndim() == 2 && expert_indices.size(0) == hidden_states.size(0))
@@ -3778,12 +3883,38 @@ Array<Tensor> sgl_trtllm_bf16_routed_moe_lora(
   TVM_FFI_ICHECK_EQ(gate_up_lora_delta.ndim(), 3)
       << "gate_up_lora_delta must be [num_tokens, top_k, 2*intermediate_size].";
   TVM_FFI_ICHECK_EQ(gate_up_lora_delta.size(2), 2 * intermediate_size);
-  TVM_FFI_ICHECK_EQ(activation_lora_input.dtype(), dl_bfloat16) << "activation_lora_input must be bf16.";
-  TVM_FFI_ICHECK_EQ(activation_lora_input.ndim(), 3)
-      << "activation_lora_input must be [num_tokens, top_k, intermediate_size].";
-  TVM_FFI_ICHECK_EQ(activation_lora_input.size(2), intermediate_size);
-  TVM_FFI_ICHECK(gate_up_lora_delta.IsContiguous() && activation_lora_input.IsContiguous())
-      << "lora bridge buffers must be contiguous.";
+  TVM_FFI_ICHECK(gate_up_lora_delta.IsContiguous()) << "gate_up_lora_delta must be contiguous.";
+  // opt6 (SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE): the activation kernel's
+  // activation_lora_input side-capture holds the SAME values as the permuted activated
+  // buffer (bf16 has no output scale, unlike fp8/fp4). When the caller provides
+  // activated_out + expanded_to_permuted_out instead, the capture write is skipped and
+  // the python-side down-LoRA shrink reads activated_out via the permuted-row map.
+  if (activation_lora_input.has_value()) {
+    TVM_FFI_ICHECK_EQ(activation_lora_input.value().dtype(), dl_bfloat16)
+        << "activation_lora_input must be bf16.";
+    TVM_FFI_ICHECK_EQ(activation_lora_input.value().ndim(), 3)
+        << "activation_lora_input must be [num_tokens, top_k, intermediate_size].";
+    TVM_FFI_ICHECK_EQ(activation_lora_input.value().size(2), intermediate_size);
+    TVM_FFI_ICHECK(activation_lora_input.value().IsContiguous())
+        << "activation_lora_input must be contiguous.";
+  } else {
+    TVM_FFI_ICHECK(activated_out.has_value() && expanded_to_permuted_out.has_value())
+        << "bf16 LoRA: without activation_lora_input, activated_out + "
+           "expanded_to_permuted_out are required for the down-LoRA shrink.";
+  }
+  if (activated_out.has_value()) {
+    TVM_FFI_ICHECK_EQ(activated_out.value().dtype(), dl_bfloat16) << "activated_out must be bf16.";
+    TVM_FFI_ICHECK(activated_out.value().ndim() == 2 &&
+                   activated_out.value().size(1) == intermediate_size &&
+                   activated_out.value().IsContiguous())
+        << "activated_out must be a contiguous [>=max_padded, intermediate_size] bf16 tensor.";
+    TVM_FFI_ICHECK(expanded_to_permuted_out.has_value())
+        << "activated_out requires expanded_to_permuted_out.";
+    TVM_FFI_ICHECK(expanded_to_permuted_out.value().dtype() == dl_int32 &&
+                   expanded_to_permuted_out.value().numel() == hidden_states.size(0) * top_k &&
+                   expanded_to_permuted_out.value().IsContiguous())
+        << "expanded_to_permuted_out must be contiguous int32 [num_tokens*top_k].";
+  }
 
   int64_t const num_tokens = hidden_states.size(0);
   int64_t const tile_tokens_dim =
@@ -3799,7 +3930,10 @@ Array<Tensor> sgl_trtllm_bf16_routed_moe_lora(
       activation_lora_input,
       output,
       lora_ready_event,
-      gemm2_done_event);
+      gemm2_done_event,
+      activated_out,
+      expanded_to_permuted_out,
+      gemm1_weights_fold);
   return launcher.run(
       num_experts,
       top_k,
@@ -4091,6 +4225,58 @@ Array<int64_t> sgl_trtllm_fp4_probe_unfused(
       probe(ActivationType::Relu2, false)};
 }
 
+// opt7-step0: bf16 analogue of sgl_trtllm_fp4_probe_unfused. Decides the in-MoE fold route:
+// if the unfused-activation gated GEMM1 cubin exists for Bfloat16 ([1] or [2] > 0), route (a)
+// is just wiring; if -1/0 (the expected "missing-unfused-cubin wall", same as NVFP4), the fold
+// must be route (b): a new CUTLASS grouped GEMM with gather-prologue + SwiGLU-LoRA EVT epilogue.
+Array<int64_t> sgl_trtllm_bf16_probe_unfused(
+    int64_t top_k,
+    int64_t hidden_size,
+    int64_t intermediate_size,
+    int64_t num_local_experts,
+    int64_t num_tokens,
+    int64_t tile_n) {
+  using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+  using ActivationType = tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
+  // Probe variants:
+  //   [0] Swiglu fused, BlockMajorK   (the normal no-LoRA bf16 path) -> sanity, expect >0
+  //   [1] Swiglu unfused, BlockMajorK (fusedAct=false gated GEMM1)   -> the route-(a) question
+  //   [2] Swiglu unfused, MajorK      (in case it only exists in FP4's weight layout)
+  //   [3] Identity non-gated, BlockMajorK (plain route-act GEMM1, raw 2*inter output)
+  auto probe = [&](ActivationType act, bool unfuse, batchedGemm::gemm::MatrixLayout layout) -> int64_t {
+    try {
+      RunnerType r(
+          btg::Dtype::Bfloat16,
+          btg::Dtype::Bfloat16,
+          /*useDeepSeekFp8=*/false,
+          static_cast<int>(tile_n),
+          act,
+          /*useShuffledMatrix=*/true,
+          layout,
+          /*usePerTokenScalingGemm1=*/false,
+          /*usePerTokenScalingGemm2=*/false,
+          /*usePerChannelScalingGemm1=*/false,
+          /*usePerChannelScalingGemm2=*/false,
+          /*unfuseActForLora=*/unfuse);
+      auto cfgs = r.getValidConfigIndices(
+          static_cast<int32_t>(top_k),
+          static_cast<int32_t>(hidden_size),
+          static_cast<int32_t>(intermediate_size),
+          static_cast<int32_t>(num_local_experts),
+          static_cast<int32_t>(num_tokens));
+      return static_cast<int64_t>(cfgs.size());
+    } catch (...) {
+      return -1;
+    }
+  };
+  using ML = batchedGemm::gemm::MatrixLayout;
+  return {
+      probe(ActivationType::Swiglu, false, ML::BlockMajorK),
+      probe(ActivationType::Swiglu, true, ML::BlockMajorK),
+      probe(ActivationType::Swiglu, true, ML::MajorK),
+      probe(ActivationType::Identity, false, ML::BlockMajorK)};
+}
+
 // Evaluate Solution 1: use the non-gated routeAct=false GEMM2-style batched GEMM as the gate_up
 // (GEMM1) projection. Returns [num_passing_cubins, num_valid_for_dims] for an E2m1->bf16 Gemm2
 // runner at the requested (output=out_dim, K=k_dim) shape. A positive valid count means the
@@ -4320,6 +4506,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_block_scale_moe_lora, sgl_trtllm_fp
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     sgl_trtllm_fp4_block_scale_moe_lora_finalize, sgl_trtllm_fp4_block_scale_moe_lora_finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_probe_unfused, sgl_trtllm_fp4_probe_unfused);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_bf16_probe_unfused, sgl_trtllm_bf16_probe_unfused);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_probe_gemm2, sgl_trtllm_fp4_probe_gemm2);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_permute, bench_permute);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bench_nvfp4_quant, bench_nvfp4_quant);

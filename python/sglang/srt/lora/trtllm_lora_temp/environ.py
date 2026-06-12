@@ -80,6 +80,27 @@ class _LoraEnvs:
     SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE = _GatedBool(
         "SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE", True
     )
+    # opt6 (bf16-only): skip the activation kernel's redundant activation_lora_input
+    # side-capture at prefill — for bf16 it holds the SAME values as the permuted
+    # activated buffer (no output scale, unlike fp8/fp4), so the down-LoRA shrink
+    # reads activated_out via the expanded->permuted row map instead. Saves the
+    # [num_tokens*top_k, inter] bf16 HBM write (~50 MB/layer at 4096-tok chunks).
+    # Measured 2026-06-11: NO CLEAR WIN — the ~0.5%/prefill saving is below the ±2%
+    # noise floor and the map D2D export adds a launch. Default False (off = byte-
+    # identical to the pre-opt6 path); the mechanism (permuted-buffer read via row
+    # map) is kept as the stepping stone for the opt7 fold pipeline.
+    SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE = _GatedBool(
+        "SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE", False
+    )
+    # opt7 (bf16-only): the in-MoE fold. DUAL_LAYOUT keeps a plain interleaved [E,2I,K]
+    # copy of gemm1 weights at load (+~9.7GB/rank on this model) so the prefill path can
+    # run the CUTLASS fold GEMM while decode keeps the tuned trtllm cubin. GEMM1_FOLD
+    # switches the prefill (>=512 tokens) Bf16LoraLauncher pipeline to
+    # gather -> fold-GEMM(SwiGLU+LoRA in epilogue) -> down GEMM, replacing
+    # permute + gate_up GEMM + activation (measured 101.5us vs 270us at per-rank shapes).
+    # Default False until e2e-validated (acc + matrix); requires DUAL_LAYOUT.
+    SGLANG_OPT_BF16_MOE_DUAL_LAYOUT = _GatedBool("SGLANG_OPT_BF16_MOE_DUAL_LAYOUT", False)
+    SGLANG_OPT_BF16_MOE_GEMM1_FOLD = _GatedBool("SGLANG_OPT_BF16_MOE_GEMM1_FOLD", False)
     # opt3: cache the layer-static fields of LoRAInfo so _get_lora_info rebuilds only the
     # per-batch fields each forward — cuts the per-layer Python cost paid on the eager
     # prefill path (decode runs under cuda-graph, so it sees this only at capture).

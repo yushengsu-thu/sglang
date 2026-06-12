@@ -379,11 +379,51 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
         local_num_experts=runner_config.num_local_experts,
     )
 
-    activation_lora_input = torch.empty(
-        (hidden_states.shape[0], runner_config.top_k, inter),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+    # opt6 (SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE, prefill-only): skip the redundant
+    # expanded-layout activation_lora_input side-capture — bf16's activated buffer holds
+    # the same values (no output scale, unlike fp8/fp4). The down-LoRA shrink reads the
+    # permuted activated_out via the expanded->permuted row map instead. Decode (<512
+    # tokens) keeps the capture: two-stream needs the independent side buffer, and the
+    # tiny write is in the cuda graph.
+    from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs as _lora_envs
+
+    num_tokens = hidden_states.shape[0]
+    # opt7: the in-MoE fold (prefill-only). Requires the dual-layout fold weights and
+    # implies the opt6 activated/map plumbing (the fold has no capture write at all).
+    w_fold = getattr(quant_info, "gemm1_weights_fold", None)
+    use_fold = (
+        _lora_envs.SGLANG_OPT_BF16_MOE_GEMM1_FOLD.get()
+        and w_fold is not None
+        and num_tokens >= 512
     )
+    drop_act_capture = use_fold or (
+        _lora_envs.SGLANG_OPT_BF16_MOE_ACT_DROP_LORA_CAPTURE.get() and num_tokens >= 512
+    )
+    if drop_act_capture:
+        # Conservative bound for max_num_padded_tokens (= maxCtas * tile, tile <= 128:
+        # every expert can pad up to one extra tile). The launcher ICHECKs the exact value.
+        max_padded_bound = num_tokens * runner_config.top_k + (
+            quant_info.global_num_experts * 128
+        )
+        activation_lora_input = None
+        activated_out = torch.empty(
+            (max_padded_bound, inter),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        expanded_to_permuted = torch.empty(
+            (num_tokens * runner_config.top_k,),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+    else:
+        activation_lora_input = torch.empty(
+            (num_tokens, runner_config.top_k, inter),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        activated_out = None
+        expanded_to_permuted = None
 
     packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
     if packed_topk_ids is None:
@@ -430,11 +470,18 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
         activation_type=get_activation_type(
             runner_config.activation, is_gated=runner_config.is_gated
         ),
+        activated_out=activated_out,
+        expanded_to_permuted_out=expanded_to_permuted,
+        gemm1_weights_fold=(w_fold if use_fold else None),
     )
 
     merged_experts_fused_moe_lora_add(
         output=output,
-        hidden_states=activation_lora_input.view(-1, inter),
+        hidden_states=(
+            activated_out
+            if drop_act_capture
+            else activation_lora_input.view(-1, inter)
+        ),
         lora_a=lora_info.down_lora_a_weights,
         lora_b=lora_info.down_lora_b_weights,
         topk_ids=topk_ids,
@@ -449,6 +496,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=runner_config.num_local_experts,
+        a_row_map=expanded_to_permuted if drop_act_capture else None,
     )
     return StandardCombineInput(hidden_states=output)
 

@@ -65,6 +65,13 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
             flashinfer_csrc_dir / "nv_internal/cpp/common/memoryUtils.cu",
             overlay_csrc_dir / "trtllm_fused_moe_kernel_launcher.cu",
             overlay_csrc_dir / "trtllm_fused_moe_runner.cu",
+            # opt7 (bf16 in-MoE fold) skeleton: CUTLASS probe + P0 reference fold kernel.
+            overlay_csrc_dir / "bf16_moe_gemm1_fold.cu",
+            # opt7 P1: CUTLASS Sm100 grouped gate_up GEMM (plain epilogue) + its FFI shell
+            # (separate TUs: tvm-ffi's global `Tensor` clashes with cute::Tensor in CUTLASS
+            # epilogue headers at instantiation time).
+            overlay_csrc_dir / "bf16_moe_gemm1_grouped.cu",
+            overlay_csrc_dir / "bf16_moe_gemm1_grouped_ffi.cu",
             flashinfer_csrc_dir
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
             flashinfer_csrc_dir
@@ -97,5 +104,8 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
             flashinfer_csrc_dir / "nv_internal/include",
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
+            # opt7: full CUTLASS 4.x (SM100 collective builders / EVT) bundled by flashinfer.
+            flashinfer_data_dir / "cutlass/include",
+            flashinfer_data_dir / "cutlass/tools/util/include",
         ],
     )

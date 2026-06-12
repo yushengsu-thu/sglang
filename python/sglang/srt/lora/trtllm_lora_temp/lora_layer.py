@@ -95,12 +95,14 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
         )
 
         layer._lora_runner = None
+        _w13_fold = getattr(base_layer, "w13_weight_fold", None)
         layer._quant_info = FlashInferTrtllmBf16MoeQuantInfo(
             gemm1_weights=base_layer.w13_weight.data,
             gemm2_weights=base_layer.w2_weight.data,
             global_num_experts=int(base_layer.num_experts),
             local_expert_offset=int(base_layer.moe_ep_rank)
             * int(base_layer.num_local_experts),
+            gemm1_weights_fold=(_w13_fold.data if _w13_fold is not None else None),
         )
         return
 
