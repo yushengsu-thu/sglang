@@ -881,6 +881,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         lora_backend.is_moe_lora = True
 
+        # opt8: register for the piecewise split op (layer lookup by layer_id inside
+        # the op, like attention's forward-context lookup).
+        from sglang.srt.lora.trtllm_lora_temp.piecewise_split import (
+            register_moe_lora_layer,
+        )
+
+        register_moe_lora_layer(base_layer.layer_id, self)
+
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
@@ -1039,6 +1047,36 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         1. After gate_up projection, before activation
         2. After down projection, before final reduction
         """
+        # opt8: under the piecewise-cuda-graph compile/replay (extend path), route the
+        # whole MoE-LoRA dispatch through ONE opaque split op — its host-side Python
+        # (LoRAInfo build, Triton config lookup, two-stream logic) is untraceable, and
+        # running it eagerly per call also keeps the per-batch LoRA state out of the
+        # captured graphs. Mirrors the RadixAttention escape hatch.
+        from sglang.srt.compilation.piecewise_context_manager import (
+            get_forward_context,
+        )
+
+        context = get_forward_context()
+        if (
+            context is not None
+            and self._lora_runner_backend.is_experimental_sgl_trtllm()
+            and context.forward_batch.forward_mode.is_extend()
+        ):
+            from sglang.srt.lora.trtllm_lora_temp.piecewise_split import (
+                unified_moe_lora_with_output,
+            )
+
+            output = torch.empty_like(hidden_states)
+            unified_moe_lora_with_output(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                output,
+                self.base_layer.layer_id,
+                packed_topk_ids=getattr(topk_output, "packed_topk_ids", None),
+            )
+            return output
 
         # Build LoRA info for this batch
         lora_info = self._get_lora_info()
