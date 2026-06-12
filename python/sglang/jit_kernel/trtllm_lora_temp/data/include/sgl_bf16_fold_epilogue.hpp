@@ -176,27 +176,74 @@ class Sm100BF16FoldArrayEpilogue {
     int const I = params.inner_dim;
     int64_t const ld = int64_t(cute::get<0>(dD));       // row stride of half-width D
 
+    // Chunked fold: 8 accumulator elements (4 interleaved pairs -> 4 folded outputs) per
+    // step. Within a chunk we verify n-contiguity + same row once, hoist the per-row
+    // perm2exp lookup, vector-load the two half-contiguous delta runs (4x bf16 = 8B each)
+    // and vector-store the 4 folded bf16 (8B). Misaligned chunks fall back to scalars.
+    int last_m = -1, last_x = -1;
     CUTLASS_PRAGMA_UNROLL
-    for (int u = 0; u < size(frag) / 2; ++u) {
-      auto c0 = coords(2 * u);                          // (m, n, l) of the even column
+    for (int u = 0; u < size(frag); u += 8) {
+      auto c0 = coords(u);
       int const m = int(get<0>(c0));
-      int const n = int(get<1>(c0));
-      if (m >= int(M) || n + 1 >= int(N) || (n & 1)) {
-        continue;  // out of bounds, or run misaligned (defensive; should not happen)
+      int const n0 = int(get<1>(c0));
+      if (m != last_m) {
+        last_m = m;
+        last_x = (m < int(M)) ? perm2exp[m] : -1;
       }
-      int const h = n >> 1;
-      float x1 = float(frag(2 * u));                    // col 2h
-      float x2 = float(frag(2 * u + 1));                // col 2h+1
-      int const x = perm2exp[m];
-      if (x < 0) {
-        continue;  // padding row: leave D garbage (same contract as the base path)
+      if (last_x < 0 || m >= int(M)) {
+        continue;  // padding row or OOB: leave D garbage (same contract as base path)
       }
-      if (params.delta != nullptr) {
-        int64_t const base = int64_t(x) * (2 * I);
-        x1 += float(params.delta[base + I + h]);
-        x2 += float(params.delta[base + h]);
+      auto c7 = coords(u + 7);
+      bool const fast = (int(get<0>(c7)) == m) && (int(get<1>(c7)) == n0 + 7) &&
+                        ((n0 & 1) == 0) && (n0 + 7 < int(N));
+      int64_t const drow = int64_t(m) * ld;
+      if (fast) {
+        int const h0 = n0 >> 1;
+        float x1v[4], x2v[4];
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < 4; ++j) {
+          x1v[j] = float(frag(u + 2 * j));
+          x2v[j] = float(frag(u + 2 * j + 1));
+        }
+        if (params.delta != nullptr) {
+          int64_t const base = int64_t(last_x) * (2 * I);
+          // two 8B vector loads: delta[x, h0..h0+3] (-> x2) and delta[x, I+h0..I+h0+3] (-> x1)
+          uint2 const d_lo = *reinterpret_cast<uint2 const*>(&params.delta[base + h0]);
+          uint2 const d_hi = *reinterpret_cast<uint2 const*>(&params.delta[base + I + h0]);
+          ElementD const* dlo = reinterpret_cast<ElementD const*>(&d_lo);
+          ElementD const* dhi = reinterpret_cast<ElementD const*>(&d_hi);
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < 4; ++j) {
+            x2v[j] += float(dlo[j]);
+            x1v[j] += float(dhi[j]);
+          }
+        }
+        ElementD outv[4];
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < 4; ++j) {
+          outv[j] = ElementD(fold_silu(x2v[j]) * x1v[j]);
+        }
+        *reinterpret_cast<uint2*>(&ptr_D[drow + h0]) = *reinterpret_cast<uint2 const*>(outv);
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < 8; j += 2) {
+          auto cj = coords(u + j);
+          int const mj = int(get<0>(cj));
+          int const nj = int(get<1>(cj));
+          if (mj >= int(M) || nj + 1 >= int(N) || (nj & 1)) continue;
+          int const xj = (mj == m) ? last_x : perm2exp[mj];
+          if (xj < 0) continue;
+          int const h = nj >> 1;
+          float x1 = float(frag(u + j));
+          float x2 = float(frag(u + j + 1));
+          if (params.delta != nullptr) {
+            int64_t const base = int64_t(xj) * (2 * I);
+            x1 += float(params.delta[base + I + h]);
+            x2 += float(params.delta[base + h]);
+          }
+          ptr_D[int64_t(mj) * ld + h] = ElementD(fold_silu(x2) * x1);
+        }
       }
-      ptr_D[int64_t(m) * ld + h] = ElementD(fold_silu(x2) * x1);
     }
 
     return cute::make_tuple(acc_pipe_consumer_state, load_pipe_consumer_state);
