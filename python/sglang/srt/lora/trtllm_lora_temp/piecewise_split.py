@@ -101,3 +101,33 @@ def unified_embedding_lora_with_output(
     output[:real].copy_(out)
     if output.shape[0] > real:
         output[real:].copy_(base_output[real:])
+
+
+_DENSE_LORA_LAYERS: Dict[int, object] = {}
+
+
+def register_dense_lora_layer(layer) -> int:
+    idx = len(_DENSE_LORA_LAYERS)
+    _DENSE_LORA_LAYERS[idx] = layer
+    return idx
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def unified_dense_lora_with_output(
+    x: torch.Tensor,
+    base_output: torch.Tensor,
+    output: torch.Tensor,
+    layer_idx: int,
+) -> None:
+    """opt8 step8x: dense (qkv/o/column/replicated/lm-head) LoRA applies as split
+    ops — their serial fallbacks read the SHARED lora_backend's batch_info/
+    sgemm_batch_info in-graph (guard #3: ___check_type_id on per-batch objects).
+    The base GEMM stays in the graph; only the LoRA delta runs eagerly here."""
+    layer = _DENSE_LORA_LAYERS[layer_idx]
+    context = get_forward_context()
+    real = context.forward_batch.num_token_non_padded_cpu
+    out = layer.apply_lora(base_output[:real], x[:real])
+    output[:real].copy_(out)
+    if output.shape[0] > real:
+        output[real:].copy_(base_output[real:])

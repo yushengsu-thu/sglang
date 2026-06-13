@@ -45,6 +45,33 @@ class BaseLayerWithLoRA(nn.Module):
         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
             self.bias = self.base_layer.bias
 
+        # opt8 step8x: dense-LoRA piecewise split-op registry (see piecewise_split.py)
+        from sglang.srt.lora.trtllm_lora_temp.piecewise_split import (
+            register_dense_lora_layer,
+        )
+
+        self._piecewise_idx = register_dense_lora_layer(self)
+
+    def _apply_lora_maybe_split(
+        self, base_output: torch.Tensor, x: torch.Tensor
+    ) -> torch.Tensor:
+        # opt8 step8x: under the piecewise forward, apply LoRA as an opaque split
+        # op (in-graph batch_info/sgemm_info reads guard per-batch objects and
+        # recompile at replay). Traced code reads only context none-ness.
+        from sglang.srt.compilation.piecewise_context_manager import (
+            get_forward_context,
+        )
+
+        if get_forward_context() is not None:
+            from sglang.srt.lora.trtllm_lora_temp.piecewise_split import (
+                unified_dense_lora_with_output,
+            )
+
+            output = torch.empty_like(base_output)
+            unified_dense_lora_with_output(x, base_output, output, self._piecewise_idx)
+            return output
+        return self.apply_lora(base_output, x)
+
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
 
@@ -401,7 +428,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
 
         # Apply LoRA if set
         if self.set_lora:
-            base_output = self.apply_lora(base_output, hidden_states)
+            base_output = self._apply_lora_maybe_split(base_output, hidden_states)
 
         return base_output
 
@@ -490,7 +517,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
         if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_)
+            output_parallel = self._apply_lora_maybe_split(output_parallel, input_)
 
         if self.base_layer.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -772,7 +799,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             )
         else:
             if self.set_lora:
-                output_parallel = self.apply_lora(output_parallel, input_parallel)
+                output_parallel = self._apply_lora_maybe_split(output_parallel, input_parallel)
             if should_reduce:
                 output_ = tensor_model_parallel_all_reduce(output_parallel)
             else:
@@ -871,7 +898,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
         if self.set_lora:
-            output = self.apply_lora(output, x)
+            output = self._apply_lora_maybe_split(output, x)
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
