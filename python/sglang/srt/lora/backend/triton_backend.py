@@ -308,7 +308,16 @@ class TritonLoRABackend(BaseLoRABackend):
             torch.cumsum(
                 batch_info.seg_lens[:bs], dim=0, out=batch_info.seg_indptr[1 : bs + 1]
             )
-            batch_info.max_len = int(max(forward_batch.extend_seq_lens_cpu))
+            # CONSTANT max_len: in-graph LoRA kernels size their grids from this
+            # host int, and dynamo guards on its exact VALUE — a per-batch value
+            # recompiles on every new length and asserts at replay ("PCG capture
+            # stream is not set"). Worst-case grid + in-kernel seg-tensor masking is
+            # the same contract the decode cuda graph uses.
+            from sglang.srt.server_args import get_global_server_args
+
+            batch_info.max_len = (
+                get_global_server_args().piecewise_cuda_graph_max_tokens or 4096
+            )
         else:
             max_len = (
                 # Calculate max_len from the CPU copy to avoid D2H transfer.
