@@ -302,12 +302,17 @@ class TritonLoRABackend(BaseLoRABackend):
             # stale storages into the replayed graphs. Mirror the decode
             # cuda_graph_batch_info: one persistent buffer set, updated in place.
             batch_info = self._get_piecewise_batch_info()
-            batch_info.bs = bs
-            batch_info.num_segments = bs
+            # CONSTANT bs (capacity): the in-graph kernel grids read batch_info.bs —
+            # dynamo guards the exact int (capture dummy batch has bs=1, real chunks
+            # have 2/4/16 → guard miss → replay assert), and the captured grids are
+            # frozen anyway. Capacity-sized segment loop + zeroed tails = empty
+            # segments do no work; same masking contract as the decode graph.
+            batch_info.bs = self._PIECEWISE_MAX_BS
+            batch_info.num_segments = self._PIECEWISE_MAX_BS
             batch_info.seg_lens[:bs].copy_(forward_batch.extend_seq_lens)
-            torch.cumsum(
-                batch_info.seg_lens[:bs], dim=0, out=batch_info.seg_indptr[1 : bs + 1]
-            )
+            batch_info.seg_lens[bs:].zero_()
+            batch_info.weight_indices[bs:].zero_()
+            torch.cumsum(batch_info.seg_lens, dim=0, out=batch_info.seg_indptr[1:])
             # CONSTANT max_len: in-graph LoRA kernels size their grids from this
             # host int, and dynamo guards on its exact VALUE — a per-batch value
             # recompiles on every new length and asserts at replay ("PCG capture
