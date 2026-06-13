@@ -73,6 +73,13 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_backend)
         self.weight = base_layer.weight
+        # opt8 step7f: register for the piecewise split op (the embedding LoRA
+        # kernel must run eagerly between graph pieces - see piecewise_split.py).
+        from sglang.srt.lora.trtllm_lora_temp.piecewise_split import (
+            register_embedding_lora_layer,
+        )
+
+        register_embedding_lora_layer(self)
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
         self.num_embeddings = base_layer.num_embeddings
@@ -212,6 +219,22 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         # Apply LoRA if configured
         if self.set_lora:
+            # opt8 step7f: under the piecewise forward run the LoRA part as an
+            # opaque split op (in-graph batch_info reads guard host ints and
+            # recompile at replay). Traced code reads only context none-ness.
+            from sglang.srt.compilation.piecewise_context_manager import (
+                get_forward_context,
+            )
+
+            if get_forward_context() is not None:
+                from sglang.srt.lora.trtllm_lora_temp.piecewise_split import (
+                    unified_embedding_lora_with_output,
+                )
+
+                output = torch.empty_like(base_output)
+                unified_embedding_lora_with_output(base_output, input_, output)
+                return output
+
             # The backend's run_lora_a_embedding now handles both regular
             # and extra tokens efficiently with CUDA graph support
             base_output = self.apply_lora(base_output, input_, batch_info)
