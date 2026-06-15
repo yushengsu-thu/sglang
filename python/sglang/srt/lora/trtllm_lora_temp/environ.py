@@ -120,6 +120,18 @@ class _LoraEnvs:
     # diagnostics / tuning:
     SGLANG_OPT_LORA_SHRINK_TUNE = _GatedBool("SGLANG_OPT_LORA_SHRINK_TUNE", False)
 
+    # bf16 shared-outer (TML) gate_up shrink dedup (opt ①): when gate_up LoRA-A is
+    # shared across experts (experts_shared_outer_loras_a), A@x is identical for a
+    # token's top_k slots — the per-slot grouped shrink computes it top_k times. With
+    # this on, compute A@x ONCE per token (dense GEMM) and broadcast into the
+    # [M, top_k, r] intermediate, so the expand stage + two-stream are byte-unchanged.
+    # Scoped to max_loras==1 (the production config). Default OFF: the e2e ceiling is
+    # ~0 in the current host-bound/overlapped regime (sanity_check_opt) — this is a
+    # parked kernel-time/HBM win for when prefill becomes host-unbound. bf16-only.
+    SGLANG_OPT_BF16_MOE_SHARED_SHRINK_DEDUP = _GatedBool(
+        "SGLANG_OPT_BF16_MOE_SHARED_SHRINK_DEDUP", False
+    )
+
     # kimi NVFP4 permute+quant fuse — read in jit_kernel/trtllm_lora_temp/core.py (Python) to pass
     # a bool to the kernel, AND C++-side via getenv in the launcher. Default off (kimi-only).
     SGLANG_OPT_FUSED_PERMUTE_QUANT = _GatedBool("SGLANG_OPT_FUSED_PERMUTE_QUANT", False)

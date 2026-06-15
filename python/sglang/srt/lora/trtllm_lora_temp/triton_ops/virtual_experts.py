@@ -876,7 +876,50 @@ def _merged_experts_fused_moe_lora_add_impl(
     b_stage_config = _get_stage_config(lora_b_virtual, 1)
 
     intermediate = intermediate_buffer
-    if stage != "expand":
+    dedup_shared_a = (
+        stage != "expand"
+        and lora_envs.SGLANG_OPT_BF16_MOE_SHARED_SHRINK_DEDUP.get()
+        and experts_shared_outer_loras_a
+        and max_loras == 1
+    )
+    if dedup_shared_a:
+        # opt ①: gate_up LoRA-A is shared across experts, so A@x is identical for a
+        # token's top_k slots — the per-slot grouped shrink (the elif branch) computes it
+        # top_k times. Compute it ONCE per token via a dense GEMM (reads x M times, not
+        # M*top_k) and broadcast into the [M, top_k, r] intermediate, leaving the expand
+        # stage and the two-stream "shrink"/"expand" split byte-unchanged. lora_a_virtual
+        # is [max_loras*expert_dim, r, K] = [1, r, K] here (max_loras==1, shared
+        # expert_dim==1); tokens with no adapter (lora_id == -1) must get a zero delta.
+        # Numerically equivalent to the grouped shrink at the KL floor (the GEMM kernel
+        # differs: cuBLAS mm vs the Triton split-k kernel), NOT bitwise vs flag-OFF.
+        num_tokens_m = token_lora_mapping.shape[0]
+        shrink_top_k = topk_ids.shape[1]
+        shared_delta = torch.mm(hidden_states, lora_a_virtual[0].t())  # [M, r]
+        # Mask tokens with no adapter (lora_id == -1) UNCONDITIONALLY. A data-dependent
+        # `if bool(valid.all())` would sync GPU->CPU and is ILLEGAL under cuda-graph
+        # capture (cudaErrorStreamCaptureUnsupported); the multiply is cheap (M*r).
+        valid = (token_lora_mapping >= 0).to(shared_delta.dtype)  # [M]
+        shared_delta = shared_delta * valid.unsqueeze(1)
+        broadcast = shared_delta.unsqueeze(1).expand(
+            num_tokens_m, shrink_top_k, max_lora_rank
+        )
+        if intermediate is None:
+            intermediate = broadcast.contiguous()
+        else:
+            intermediate.copy_(broadcast)
+        if stage == "shrink":
+            # Pre-warm the routing-B cache like the grouped path so the later "expand"
+            # stage launches no routing kernels (it overlaps finalize with the shrink).
+            if routing_cache is not None:
+                _get_routing(
+                    topk_ids,
+                    token_lora_mapping,
+                    num_experts_b,
+                    experts_shared_outer_loras_b,
+                    b_stage_config["BLOCK_SIZE_M"],
+                )
+            return intermediate
+    elif stage != "expand":
         a_stage_config = _get_shrink_stage_config(
             lora_a_virtual, token_lora_mapping.shape[0]
         )
