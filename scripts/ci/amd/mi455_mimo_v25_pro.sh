@@ -13,6 +13,15 @@ MODEL_PATH="${MODEL_PATH:-/model/MiMo-V2.5-Pro}"
 TP_SIZE="${TP_SIZE:-4}"
 PORT="${PORT:-8100}"
 MODE="${MODE:-smoke}"
+MODEL_LOADER_EXTRA_CONFIG="${MODEL_LOADER_EXTRA_CONFIG:-}"
+
+if [[ -z "${MODEL_LOADER_EXTRA_CONFIG}" ]]; then
+  # The 1.03 TB checkpoint has 34 roughly 30 GB shards. SGLang's default
+  # eight-worker buffered loader can retain up to ten shards per TP rank,
+  # which creates an excessive host-memory peak when four ranks load in
+  # parallel. Prefer bounded, single-threaded loading for first bring-up.
+  MODEL_LOADER_EXTRA_CONFIG='{"enable_multithread_load": false}'
+fi
 
 export PYTHONPATH="${REPO_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
@@ -147,7 +156,7 @@ common_args=(
   --page-size "${PAGE_SIZE:-64}"
   --mem-fraction-static "${MEM_FRACTION_STATIC:-0.80}"
   --watchdog-timeout "${WATCHDOG_TIMEOUT:-1200}"
-  --model-loader-extra-config '{"enable_multithread_load": true}'
+  --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}"
   --port "${PORT}"
 )
 
