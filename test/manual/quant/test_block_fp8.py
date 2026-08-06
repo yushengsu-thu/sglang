@@ -19,7 +19,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     triton_mxfp8_blockscaled_linear,
 )
-from sglang.srt.utils import is_sm100_supported, is_sm120_supported
+from sglang.srt.utils import (
+    is_gfx1250_supported,
+    is_sm100_supported,
+    is_sm120_supported,
+)
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
@@ -644,6 +648,27 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
                 seed=params[7],
             ):
                 self._w8a8_block_fp8_fused_moe(*params)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and is_gfx1250_supported(),
+        "This regression test targets gfx1250 only.",
+    )
+    def test_gfx1250_w8a8_block_fp8_fused_moe(self):
+        # Small MiMo-style 128x128 block-FP8 case. This specifically compiles
+        # and executes the gfx1250 BF16-upcast tl.dot fallback without loading
+        # the 1 TB MiMo-V2.5-Pro checkpoint.
+        self._w8a8_block_fp8_fused_moe(
+            M=4,
+            # MiMo-Pro TP4 routed-expert shard: hidden=6144,
+            # moe_intermediate=2048 / TP4 = 512.
+            N=512,
+            K=6144,
+            E=8,
+            topk=8,
+            block_size=[128, 128],
+            dtype=torch.bfloat16,
+            seed=0,
+        )
 
 
 # For test
