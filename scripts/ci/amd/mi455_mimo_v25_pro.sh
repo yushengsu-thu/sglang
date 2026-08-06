@@ -6,11 +6,15 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
+
 MODEL_PATH="${MODEL_PATH:-/model/MiMo-V2.5-Pro}"
 TP_SIZE="${TP_SIZE:-4}"
 PORT="${PORT:-8100}"
 MODE="${MODE:-smoke}"
 
+export PYTHONPATH="${REPO_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export HSA_COREDUMP_PATTERN="${HSA_COREDUMP_PATTERN:-/dev/null}"
 
