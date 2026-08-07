@@ -13,12 +13,13 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     triton_mxfp8_blockscaled_linear,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import (
     is_gfx1250_supported,
     is_sm100_supported,
@@ -566,7 +567,13 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
+        cls._server_args_override = get_context().override_server_args()
+        cls._server_args_override.install()
         torch.set_default_device("cuda")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._server_args_override.restore()
 
     def _w8a8_block_fp8_fused_moe(self, M, N, K, E, topk, block_size, dtype, seed):
         torch.manual_seed(seed)
@@ -604,10 +611,15 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
             ref_out = torch_w8a8_block_fp8_moe(
                 a, w1, w2, w1_s, w2_s, score, topk, block_size
             )
-            topk_output = select_experts(
-                hidden_states=a,
+            # Keep this fused-MoE regression independent of the AOT top-k
+            # router, which has its own platform-specific coverage.
+            topk_weights, topk_ids = torch.topk(
+                torch.softmax(score, dim=-1, dtype=torch.float32), topk
+            )
+            topk_output = StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids.to(torch.int32),
                 router_logits=score,
-                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
             out = fused_moe(
                 a,
