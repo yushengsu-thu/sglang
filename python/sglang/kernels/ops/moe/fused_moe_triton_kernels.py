@@ -462,9 +462,7 @@ def fused_moe_kernel(
             )
         return
 
-    offs_bn_unmasked = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(
-        tl.int64
-    )
+    offs_bn_unmasked = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     if IS_GFX1250 and use_fp8_w8a8 and group_n > 0 and group_k > 0:
         # Avoid the modulo-wrapped matrix offsets that are intermittently
         # miscompiled into out-of-bounds accesses by the gfx1250 Triton stack.
