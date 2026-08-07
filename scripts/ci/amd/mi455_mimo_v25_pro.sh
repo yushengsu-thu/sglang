@@ -4,7 +4,7 @@
 # MODE=smoke (default) minimizes moving parts for the first health/request test.
 # MODE=benchmark enables radix cache and CUDA graphs for cache-hit/perf testing.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
@@ -14,6 +14,142 @@ TP_SIZE="${TP_SIZE:-4}"
 PORT="${PORT:-8100}"
 MODE="${MODE:-smoke}"
 MODEL_LOADER_EXTRA_CONFIG="${MODEL_LOADER_EXTRA_CONFIG:-}"
+DIAGNOSTICS_DIR="${DIAGNOSTICS_DIR:-}"
+DIAGNOSTICS_RUN_ID="${DIAGNOSTICS_RUN_ID:-mi455-mimo}"
+ENABLE_RCCL_DIAGNOSTICS="${ENABLE_RCCL_DIAGNOSTICS:-0}"
+SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-0}"
+CAPTURE_DIAGNOSTICS_SERVER_LOG="${CAPTURE_DIAGNOSTICS_SERVER_LOG:-1}"
+RCCL_DIAGNOSTICS_TO_STDOUT="${RCCL_DIAGNOSTICS_TO_STDOUT:-0}"
+
+validate_boolean() {
+  local name="$1"
+  local value="$2"
+  if [[ "${value}" != "0" && "${value}" != "1" ]]; then
+    echo "${name} must be 0 or 1, got ${value}." >&2
+    exit 2
+  fi
+}
+
+validate_boolean ENABLE_RCCL_DIAGNOSTICS "${ENABLE_RCCL_DIAGNOSTICS}"
+validate_boolean SKIP_SERVER_WARMUP "${SKIP_SERVER_WARMUP}"
+validate_boolean CAPTURE_DIAGNOSTICS_SERVER_LOG "${CAPTURE_DIAGNOSTICS_SERVER_LOG}"
+validate_boolean RCCL_DIAGNOSTICS_TO_STDOUT "${RCCL_DIAGNOSTICS_TO_STDOUT}"
+
+PHASE_LOG=""
+MANIFEST_FILE=""
+SERVER_LOG=""
+
+durable_flush() {
+  python3 -c '
+import os
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY
+if os.path.isdir(path) and hasattr(os, "O_DIRECTORY"):
+    flags |= os.O_DIRECTORY
+descriptor = os.open(path, flags)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+' "$1" 2>/dev/null || sync -d "$1" 2>/dev/null || true
+}
+
+phase() {
+  local boot_id="unknown"
+  local line
+  local timestamp
+
+  [[ -n "${PHASE_LOG}" ]] || return 0
+  timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    boot_id="$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id)"
+  fi
+  printf -v line 'ts=%s phase=%s pid=%s boot_id=%s' \
+    "${timestamp}" "$1" "$$" "${boot_id}"
+  if [[ $# -gt 1 ]]; then
+    line+=" detail=$2"
+  fi
+  printf '%s\n' "${line}" >>"${PHASE_LOG}"
+  durable_flush "${PHASE_LOG}"
+  printf '%s\n' "${line}" >&2
+}
+
+on_error() {
+  local exit_code="$1"
+  local line_number="$2"
+
+  trap - ERR
+  set +e
+  phase launcher.error "exit=${exit_code} line=${line_number}"
+  exit "${exit_code}"
+}
+
+if [[ -n "${DIAGNOSTICS_DIR}" ]]; then
+  if [[ ! "${DIAGNOSTICS_RUN_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "DIAGNOSTICS_RUN_ID must be a safe filename component." >&2
+    exit 2
+  fi
+  if [[ ! -d "${DIAGNOSTICS_DIR}" || ! -w "${DIAGNOSTICS_DIR}" ]]; then
+    echo "DIAGNOSTICS_DIR must be a pre-existing writable directory." >&2
+    exit 2
+  fi
+  if [[ "${CAPTURE_DIAGNOSTICS_SERVER_LOG}" == "1" ]] && \
+    ! command -v tee >/dev/null 2>&1; then
+    echo "tee is required when DIAGNOSTICS_DIR is set." >&2
+    exit 2
+  fi
+
+  umask 077
+  PHASE_LOG="${DIAGNOSTICS_DIR}/${DIAGNOSTICS_RUN_ID}.phases.log"
+  MANIFEST_FILE="${DIAGNOSTICS_DIR}/${DIAGNOSTICS_RUN_ID}.manifest.txt"
+  diagnostics_files=("${PHASE_LOG}" "${MANIFEST_FILE}")
+  if [[ "${CAPTURE_DIAGNOSTICS_SERVER_LOG}" == "1" ]]; then
+    SERVER_LOG="${DIAGNOSTICS_DIR}/${DIAGNOSTICS_RUN_ID}.server.log"
+    diagnostics_files+=("${SERVER_LOG}")
+  fi
+  for diagnostics_file in "${diagnostics_files[@]}"; do
+    if [[ -e "${diagnostics_file}" || -L "${diagnostics_file}" ]]; then
+      echo "Refusing to overwrite diagnostics file: ${diagnostics_file}" >&2
+      exit 2
+    fi
+  done
+  for diagnostics_file in "${diagnostics_files[@]}"; do
+    : >"${diagnostics_file}"
+    chmod 0600 "${diagnostics_file}"
+    durable_flush "${diagnostics_file}"
+  done
+  durable_flush "${DIAGNOSTICS_DIR}"
+  if [[ "${CAPTURE_DIAGNOSTICS_SERVER_LOG}" == "1" ]]; then
+    exec > >(tee -a "${SERVER_LOG}") 2>&1
+  fi
+
+  export PYTHONUNBUFFERED=1
+  export PYTHONFAULTHANDLER=1
+  if [[ "${ENABLE_RCCL_DIAGNOSTICS}" == "1" ]]; then
+    export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+    export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,BOOTSTRAP,ENV,GRAPH,P2P,SHM,NET,RAS}"
+    export NCCL_DEBUG_TIMESTAMP_LEVELS="${NCCL_DEBUG_TIMESTAMP_LEVELS:-INFO}"
+    if [[ "${RCCL_DIAGNOSTICS_TO_STDOUT}" == "1" ]]; then
+      unset NCCL_DEBUG_FILE
+    else
+      export NCCL_DEBUG_FILE="${NCCL_DEBUG_FILE:-${DIAGNOSTICS_DIR}/rccl.${DIAGNOSTICS_RUN_ID}.%h.%p.log}"
+      if [[ "${NCCL_DEBUG_FILE}" != *%p* ]]; then
+        echo "NCCL_DEBUG_FILE must contain %p to avoid multi-rank log collisions." >&2
+        exit 2
+      fi
+    fi
+  fi
+elif [[ "${ENABLE_RCCL_DIAGNOSTICS}" == "1" ]]; then
+  echo "ENABLE_RCCL_DIAGNOSTICS=1 requires DIAGNOSTICS_DIR." >&2
+  exit 2
+fi
+
+if [[ -n "${DIAGNOSTICS_DIR}" ]]; then
+  trap 'on_error "$?" "$LINENO"' ERR
+fi
+phase launcher.start "mode=${MODE} tp=${TP_SIZE}"
 
 if [[ -z "${MODEL_LOADER_EXTRA_CONFIG}" ]]; then
   # The 1.03 TB checkpoint has 34 roughly 30 GB shards. SGLang's default
@@ -50,6 +186,7 @@ if [[ ! -r "${MODEL_PATH}/model.safetensors.index.json" ]]; then
   exit 2
 fi
 
+phase checkpoint_preflight.start
 python3 - "${MODEL_PATH}" "${TP_SIZE}" <<'PY'
 import json
 import sys
@@ -115,8 +252,10 @@ print(
     file=sys.stderr,
 )
 PY
+phase checkpoint_preflight.ok
 
 if [[ "${SKIP_GPU_PREFLIGHT:-0}" != "1" ]]; then
+  phase gpu_preflight.start
   if [[ ! -r /sys/module/amdgpu/parameters/gpu_recovery ]]; then
     echo "amdgpu is not loaded; run: sudo modprobe amdgpu gpu_recovery=0" >&2
     exit 2
@@ -126,7 +265,8 @@ if [[ "${SKIP_GPU_PREFLIGHT:-0}" != "1" ]]; then
     echo "Expected amdgpu gpu_recovery=0, found ${gpu_recovery}." >&2
     exit 2
   fi
-  python3 - "${TP_SIZE}" <<'PY'
+python3 - "${TP_SIZE}" <<'PY'
+import importlib.metadata
 import sys
 
 import torch
@@ -142,8 +282,19 @@ for index in range(tp_size):
     arch = torch.cuda.get_device_properties(index).gcnArchName
     if "gfx1250" not in arch:
         raise SystemExit(f"GPU {index} is {arch}, expected gfx1250.")
-print(f"gfx1250 preflight passed for {tp_size} GPUs", file=sys.stderr)
+try:
+    triton_version = importlib.metadata.version("triton")
+except importlib.metadata.PackageNotFoundError:
+    triton_version = "unknown"
+print(
+    f"gfx1250 preflight passed for {tp_size} GPUs: "
+    f"torch={torch.__version__} hip={torch.version.hip} triton={triton_version}",
+    file=sys.stderr,
+)
 PY
+  phase gpu_preflight.ok
+else
+  phase gpu_preflight.skipped
 fi
 
 common_args=(
@@ -184,5 +335,84 @@ case "${MODE}" in
     ;;
 esac
 
+if [[ "${SKIP_SERVER_WARMUP}" == "1" ]]; then
+  mode_args+=(--skip-server-warmup)
+fi
+
+launch_cmd=(python3)
+if [[ -n "${DIAGNOSTICS_DIR}" ]]; then
+  launch_cmd+=(-u -X faulthandler)
+fi
+launch_cmd+=(-m sglang.launch_server "${common_args[@]}" "${mode_args[@]}")
+
+if [[ -n "${MANIFEST_FILE}" ]]; then
+  {
+    printf 'recorded_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'hostname=%s\n' "$(hostname 2>/dev/null || printf unknown)"
+    if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+      printf 'boot_id=%s\n' "$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id)"
+    fi
+    if [[ -r /proc/cmdline ]]; then
+      printf 'kernel_cmdline=%q\n' "$(</proc/cmdline)"
+    fi
+    printf 'uname=%q\n' "$(uname -a 2>/dev/null || printf unknown)"
+    printf 'python=%q\n' "$(python3 --version 2>&1 || true)"
+    if command -v git >/dev/null 2>&1; then
+      printf 'git_head=%s\n' "$(git -c safe.directory="${REPO_ROOT}" -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || printf unknown)"
+      printf 'git_status_begin\n'
+      git -c safe.directory="${REPO_ROOT}" -C "${REPO_ROOT}" status --porcelain=v1 2>/dev/null || true
+      printf 'git_status_end\n'
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "${BASH_SOURCE[0]}" | sed 's/^/launcher_sha256=/'
+    elif command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 "${BASH_SOURCE[0]}" | sed 's/^/launcher_sha256=/'
+    fi
+    printf 'selected_environment_begin\n'
+    for variable_name in \
+      MODE MODEL_PATH TP_SIZE PORT CUDA_VISIBLE_DEVICES PAGE_SIZE \
+      MEM_FRACTION_STATIC WATCHDOG_TIMEOUT MODEL_LOADER_EXTRA_CONFIG \
+      CONTEXT_LENGTH CHUNKED_PREFILL_SIZE MAX_RUNNING_REQUESTS \
+      SKIP_GPU_PREFLIGHT SKIP_SERVER_WARMUP SGLANG_USE_AITER ENABLE_CK \
+      AITER_FORCE_A8W4 PYTHONUNBUFFERED PYTHONFAULTHANDLER \
+      PATH PYTHONPATH LD_LIBRARY_PATH LD_PRELOAD DIAGNOSTICS_DIR \
+      DIAGNOSTICS_RUN_ID ENABLE_RCCL_DIAGNOSTICS \
+      CAPTURE_DIAGNOSTICS_SERVER_LOG RCCL_DIAGNOSTICS_TO_STDOUT \
+      TORCH_SHOW_CPP_STACKTRACES HSA_COREDUMP_PATTERN HSA_ENABLE_SDMA \
+      HSA_ENABLE_PEER_SDMA HSA_XNACK HSAKMT_DEBUG_LEVEL \
+      HIP_LAUNCH_BLOCKING AMD_SERIALIZE_KERNEL NCCL_DEBUG \
+      NCCL_DEBUG_SUBSYS NCCL_DEBUG_FILE NCCL_ALGO NCCL_PROTO \
+      NCCL_P2P_DISABLE NCCL_SHM_DISABLE NCCL_IB_DISABLE; do
+      if declare -p "${variable_name}" >/dev/null 2>&1; then
+        printf '%s=%q\n' "${variable_name}" "${!variable_name}"
+      else
+        printf '%s=<unset>\n' "${variable_name}"
+      fi
+    done
+    printf 'runtime_environment_begin\n'
+    while IFS= read -r variable_name; do
+      case "${variable_name}" in
+        CUDA_* | HIP_* | HSA_* | ROCR_* | ROCM_* | NCCL_* | RCCL_* | \
+          TORCH_NCCL_* | SGLANG_* | AITER_* | TRITON_* | MORI_* | OMP_*)
+          case "${variable_name}" in
+            *KEY* | *TOKEN* | *SECRET* | *PASS* | *CREDENTIAL*)
+              printf '%s=<redacted>\n' "${variable_name}"
+              ;;
+            *) printf '%s=%q\n' "${variable_name}" "${!variable_name}" ;;
+          esac
+          ;;
+      esac
+    done < <(compgen -e | LC_ALL=C sort -u)
+    printf 'runtime_environment_end\n'
+    printf 'python_executable=%q\n' "$(command -v python3 2>/dev/null || printf unknown)"
+    printf 'selected_environment_end\n'
+    printf 'argv='
+    printf ' %q' "${launch_cmd[@]}"
+    printf '\n'
+  } >"${MANIFEST_FILE}"
+  durable_flush "${MANIFEST_FILE}"
+fi
+
 echo "Launching MiMo-V2.5-Pro: mode=${MODE} tp=${TP_SIZE} model=${MODEL_PATH}" >&2
-exec python3 -m sglang.launch_server "${common_args[@]}" "${mode_args[@]}"
+phase launch_server.exec "skip_warmup=${SKIP_SERVER_WARMUP}"
+exec "${launch_cmd[@]}"
