@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx1250_supported,
     is_hip,
     is_sm90_supported,
 )
@@ -38,6 +39,7 @@ except:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_gfx1250 = _is_hip and is_gfx1250_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -383,6 +385,7 @@ def fused_moe_kernel(
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
+    IS_GFX1250: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -459,7 +462,14 @@ def fused_moe_kernel(
             )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_bn_unmasked = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    if IS_GFX1250 and use_fp8_w8a8 and group_n > 0 and group_k > 0:
+        # Avoid the modulo-wrapped matrix offsets that are intermittently
+        # miscompiled into out-of-bounds accesses by the gfx1250 Triton stack.
+        # Clamped lanes are discarded by the existing output mask.
+        offs_bn = tl.where(offs_bn_unmasked < N, offs_bn_unmasked, 0)
+    else:
+        offs_bn = offs_bn_unmasked % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     if a_desc is not None:
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
@@ -565,6 +575,13 @@ def fused_moe_kernel(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                # gfx1250 cannot safely execute the native fp8 x fp8 tl.dot used
+                # by block-quantized MoE (MiMo-V2.5-Pro uses 128x128 blocks).
+                # Match the gfx1250 dense-FP8 and attention fallbacks by doing
+                # the contraction in BF16 while retaining the FP8 block scales.
+                if IS_GFX1250 and use_fp8_w8a8:
+                    a = a.to(tl.bfloat16)
+                    b = b.to(tl.bfloat16)
                 if swap_ab:
                     a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     a_scale, b_scale = b_scale, a_scale
@@ -748,6 +765,12 @@ def invoke_fused_moe_kernel(
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    # The gfx1250 Triton stack also miscompiles this FP8 kernel when software
+    # pipelining uses more than one stage. Keep this local to block-FP8 MoE;
+    # other architectures and quantization modes retain their tuned configs.
+    if _is_gfx1250 and use_fp8_w8a8 and block_shape is not None:
+        config = {**config, "num_stages": 1}
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -960,6 +983,7 @@ def invoke_fused_moe_kernel(
             LORA_PRESERVE_BASE=lora_preserve_base,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            IS_GFX1250=_is_gfx1250,
             **config,
         )
 
